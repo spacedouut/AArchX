@@ -1297,6 +1297,7 @@ unsafe fn ndl_rollback(before: c_int) {
             ffi::ocerz_unmap((*d).map_base, (*d).map_size);
         }
         libc::free((*d).owned_buf.cast());
+        super::dlopen::symtab_hash_free(d);
         ptr::write_bytes(d, 0, 1);
         i -= 1;
     }
