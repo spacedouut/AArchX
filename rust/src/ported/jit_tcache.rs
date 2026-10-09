@@ -494,7 +494,13 @@ pub unsafe extern "C" fn tc_bind(
             }
             let val = *tc_val_ptr().wrapping_offset(i as isize);
             if (*r).kind as c_int == ffi::TCR_RASSLOT as c_int {
-                tc_ras_fill(jit, val as usize as *mut *mut c_void, (*r).arg, mode32, false);
+                tc_ras_fill(
+                    jit,
+                    val as usize as *mut *mut c_void,
+                    (*r).arg,
+                    mode32,
+                    false,
+                );
             }
             if (*r).form == 1 {
                 w.cast::<u64>().write(val);
