@@ -106,6 +106,20 @@ xychart-beta
     bar [0.72, 0.77, 0.80, 0.83, 0.84, 0.86, 0.90, 0.93, 0.97, 0.97, 0.98, 0.99, 0.99, 1.00, 1.03]
 ```
 
+The same suite, run back-to-back on this branch's Rust port and the C build on
+an Apple M4 Pro VM with macOS 26 (2026-10-09). Both builds beat Rosetta on
+thirteen of the fifteen kernels, and the Rust port matches the C build within
+run-to-run noise everywhere:
+
+```mermaid
+xychart-beta
+    title "x Rosetta on M4 Pro / macOS 26: C (first bar) vs Rust port (second)"
+    x-axis [memcpy, str, fpvec, mixed, vm, fpsse, depchain, icall, brmiss, qsort, jtab, hash, idiv, chase, leafcall]
+    y-axis "x Rosetta" 0 --> 1.2
+    bar [0.76, 0.93, 0.79, 0.90, 0.79, 0.83, 0.83, 0.94, 0.95, 1.06, 0.94, 0.99, 0.92, 1.06, 1.02]
+    bar [0.74, 0.98, 0.84, 0.90, 0.82, 0.86, 0.83, 0.95, 0.94, 0.97, 0.89, 0.97, 1.01, 1.02, 0.97]
+```
+
 AVX2 and FMA loops mostly beat Rosetta too, and a call from native mode into the
 Mac's frameworks costs about 17 ns. Startup is the weak spot: everything a large
 application runs is translated the first time it runs, so Windows Steam under
