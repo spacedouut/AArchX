@@ -486,15 +486,17 @@ unsafe fn ndl_dep_order(root: *mut DynImage, published: c_int, queue: *mut *mut 
 
 unsafe fn ndl_deps_of(root: *mut DynImage, queue: *mut *mut DynImage) -> usize {
     let published = ndl_pub() as c_int;
-    let base = ptr::addr_of_mut!(super::g_dimgs).cast::<DynImage>();
-    let idx = root.offset_from(base);
-    if idx < 0 || idx >= DYN_DIMG_MAX as isize {
+    let base = ptr::addr_of_mut!(super::g_dimgs) as usize;
+    let off = (root as usize).wrapping_sub(base);
+    let size = core::mem::size_of::<DynImage>();
+    if off >= DYN_DIMG_MAX * size || off % size != 0 {
         return ndl_dep_order(root, published, queue);
     }
+    let idx = off / size;
     libc::pthread_mutex_lock(ptr::addr_of_mut!(G_NDL_DEPS_LOCK));
     let slot = ptr::addr_of_mut!(G_NDL_DEPS)
         .cast::<*mut NdlDeps>()
-        .add(idx as usize);
+        .add(idx);
     if (*slot).is_null() {
         let e = libc::malloc(core::mem::size_of::<NdlDeps>()).cast::<NdlDeps>();
         if !e.is_null() {
