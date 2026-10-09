@@ -23,6 +23,10 @@
 //! block again).  Only the overlapping blocks are retired - dropping the whole
 //! cache per flip made CEF startup a full retranslation storm.  Their code stays
 //! allocated on a retired list, so a thread still inside runs to its next exit.
+//! The words a retirement puts back (stop sites, their conditional sites, the
+//! chains of its predecessors) are collected and synchronised together once
+//! write protection is back on, one barrier per retirement rather than one per
+//! word, before the JIT lock is released.
 //! A 64 KB region whose translations keep being invalidated (a JS engine
 //! W^X-flipping its code space) is run interpreted after a few hits, but not
 //! permanently: module-load fixups also retire blocks a few times and then
@@ -3740,6 +3744,61 @@ pub unsafe extern "C" fn psc_retire_cols(vm: *mut OcerzVM, cols: u32) {
     }
 }
 
+static mut g_retire_sites: *mut *mut u32 = core::ptr::null_mut();
+static mut g_retire_nsites: usize = 0;
+static mut g_retire_sites_cap: usize = 0;
+
+unsafe fn retire_site_note(site: *mut u32) {
+    unsafe {
+        if g_retire_nsites == g_retire_sites_cap {
+            let cap = if g_retire_sites_cap != 0 {
+                g_retire_sites_cap.wrapping_mul(2)
+            } else {
+                64
+            };
+            let ns = libc::realloc(
+                g_retire_sites.cast(),
+                cap.wrapping_mul(core::mem::size_of::<*mut u32>()),
+            )
+            .cast::<*mut u32>();
+            if ns.is_null() {
+                sys_icache_invalidate(site.cast(), 4);
+                return;
+            }
+            g_retire_sites = ns;
+            g_retire_sites_cap = cap;
+        }
+        *g_retire_sites.add(g_retire_nsites) = site;
+        g_retire_nsites = g_retire_nsites.wrapping_add(1);
+    }
+}
+
+unsafe fn retire_sites_sync() {
+    unsafe {
+        let n = g_retire_nsites;
+        if n == 0 {
+            return;
+        }
+        for i in 0..n {
+            core::arch::asm!(
+                "dc cvau, {site}",
+                site = in(reg) *g_retire_sites.add(i),
+                options(preserves_flags)
+            );
+        }
+        core::arch::asm!("dsb ish", options(preserves_flags));
+        for i in 0..n {
+            core::arch::asm!(
+                "ic ivau, {site}",
+                site = in(reg) *g_retire_sites.add(i),
+                options(preserves_flags)
+            );
+        }
+        core::arch::asm!("dsb ish", "isb", options(preserves_flags));
+        g_retire_nsites = 0;
+    }
+}
+
 unsafe fn unchain_edge(sblk: *mut JitBlock, i: c_int, hits: *const *mut JitBlock, n_hits: usize) {
     unsafe {
         let edge = (*sblk).edges.add(i as usize);
@@ -3751,7 +3810,7 @@ unsafe fn unchain_edge(sblk: *mut JitBlock, i: c_int, hits: *const *mut JitBlock
             && ptr_in_hits(hits, n_hits, branch_word_target(at, *at)) != 0
         {
             AtomicU32::from_ptr(at).store(fallback, Ordering::Release);
-            sys_icache_invalidate(at.cast(), 4);
+            retire_site_note(at);
         }
         let cs = (*edge).cond_site;
         if !cs.is_null()
@@ -3760,7 +3819,7 @@ unsafe fn unchain_edge(sblk: *mut JitBlock, i: c_int, hits: *const *mut JitBlock
             && ptr_in_hits(hits, n_hits, branch_word_target(cs, *cs)) != 0
         {
             AtomicU32::from_ptr(cs).store((*edge).cond_orig, Ordering::Release);
-            sys_icache_invalidate(cs.cast(), 4);
+            retire_site_note(cs);
         }
     }
 }
@@ -3818,13 +3877,13 @@ unsafe fn retire_hit_blocks_locked(
                 && *(*b).stop_patch != (*b).stop_insn
             {
                 AtomicU32::from_ptr((*b).stop_patch).store((*b).stop_insn, Ordering::Release);
-                sys_icache_invalidate((*b).stop_patch.cast(), 4);
+                retire_site_note((*b).stop_patch);
             }
             for i in 0..(*b).n_stop_extra {
                 let extra = (*b).stop_extra.as_mut_ptr().add(i as usize);
                 if *(*extra).site != (*extra).insn {
                     AtomicU32::from_ptr((*extra).site).store((*extra).insn, Ordering::Release);
-                    sys_icache_invalidate((*extra).site.cast(), 4);
+                    retire_site_note((*extra).site);
                 }
             }
             for i in 0..(*b).n_edges {
@@ -3840,7 +3899,7 @@ unsafe fn retire_hit_blocks_locked(
                 }
                 if !cs.is_null() && (*edge).cond_orig != 0 && *cs != (*edge).cond_orig && is_stop {
                     AtomicU32::from_ptr(cs).store((*edge).cond_orig, Ordering::Release);
-                    sys_icache_invalidate(cs.cast(), 4);
+                    retire_site_note(cs);
                 }
             }
         }
@@ -3870,6 +3929,7 @@ unsafe fn retire_hit_blocks_locked(
             }
         }
         pthread_jit_write_protect_np(1);
+        retire_sites_sync();
         retire_unlink_hits(jit, hits, n_hits);
         for i in 0..g_ras_slot_n {
             let slot = core::ptr::addr_of_mut!(*g_ras_slots.add(i as usize));
