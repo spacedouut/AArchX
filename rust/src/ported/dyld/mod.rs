@@ -661,6 +661,7 @@ struct DynImage {
     file_dev: u64,
     file_ino: u64,
     symidx: *mut SymIndex,
+    symtab_hash: *mut dlopen::SymtabHash,
 }
 
 impl DynImage {
@@ -699,6 +700,7 @@ impl DynImage {
         file_dev: 0,
         file_ino: 0,
         symidx: ptr::null_mut(),
+        symtab_hash: ptr::null_mut(),
     };
 }
 
