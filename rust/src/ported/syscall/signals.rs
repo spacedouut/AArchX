@@ -229,7 +229,7 @@ pub(super) unsafe fn sys_pthread_kill(
     unsafe {
         let a = &*a;
         let signo = a[1];
-        if !libc::getenv(c"OCERZ_PTKILL".as_ptr()).is_null() {
+        if env_set!("OCERZ_PTKILL") {
             let selfport = raw::ocerz_host_mach_trap(27, a);
             let handler = if signo < OCERZ_NSIG as u64 {
                 (*guest_sigact_ptr(signo as usize)).handler
@@ -927,7 +927,7 @@ pub(super) unsafe fn sys_sigreturn(
             (*cpu).fs_base = ocerz_ld(uc.wrapping_add(64), 8);
             ocerz_st(uc.wrapping_add(72), 8, 0);
         }
-        if !libc::getenv(c"OCERZ_GSTRACE".as_ptr()).is_null() {
+        if env_set!("OCERZ_GSTRACE") {
             libc::fprintf(
                 crate::log::stderr(),
                 c"ocerz: GS sigreturn[%d] cpu#%u gs %#llx rip=%#llx%s\n".as_ptr(),
