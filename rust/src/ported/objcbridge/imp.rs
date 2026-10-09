@@ -55,7 +55,8 @@ const _: () = assert!(OB_IMP_HASH.is_power_of_two() && OB_IMP_MAX < u16::MAX as 
 unsafe fn ob_imp_find_locked(imp: *mut c_void) -> (usize, usize) {
     unsafe {
         let mask = OB_IMP_HASH - 1;
-        let mut h = ((imp as u64 >> 2).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - OB_IMP_HASH_BITS)) as usize;
+        let mut h = ((imp as u64 >> 2).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            >> (64 - OB_IMP_HASH_BITS)) as usize;
         loop {
             let at = G_OB_IMP_INDEX[h];
             if at == 0 || G_OB_IMPS[at as usize - 1].imp == imp {
