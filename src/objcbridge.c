@@ -105,6 +105,17 @@
  * _Block_copy copies one, guest-side, since the native method would run its
  * x86 copy helper.
  *
+ * ---- the descriptor cache ----
+ * A described (class, selector) pair is kept, one node per pair, and is good
+ * for the generation it was described in; registering or realizing a class
+ * and replacing an implementation start a new generation.  A send that finds
+ * its pair from an older generation looks the method up again, and when the
+ * method's type encoding still reads the same it refreshes the node's
+ * generation instead of describing it again, since the description depends on
+ * nothing but the encoding and the selector.  A pair whose encoding did change
+ * gets a new node in the old one's place; the old node stays allocated, as
+ * another thread may still be sending through it.
+ *
  * ---- results the two ABIs return differently ----
  * System V returns a structure of more than sixteen bytes in memory the caller
  * provides, and an x86 compiler therefore sends such a message with
@@ -1217,7 +1228,7 @@ typedef struct ObShape {
 } ObShape;
 
 typedef struct ObSend {
-    struct ObSend *next;
+    struct ObSend *_Atomic next;
     void *cls;
     void *sel;
     const ObShape *shape;
@@ -1225,7 +1236,8 @@ typedef struct ObSend {
     uint32_t blocks;
     uint32_t fnptrs;
     uint32_t objects;
-    uint64_t generation;
+    const char *enc;
+    _Atomic uint64_t generation;
 } ObSend;
 
 static ObShape *_Atomic g_ob_shapes[OB_SHAPE_BUCKETS];
@@ -1280,37 +1292,63 @@ static const ObShape *ob_shape(const char *notation)
     return found;
 }
 
-static const ObSend *ob_cached(void *cls, void *sel)
+static ObSend *ob_entry(void *cls, void *sel)
 {
-    uint64_t generation = atomic_load(&g_ob_generation);
-    for (const ObSend *e = g_ob_sends[ob_send_hash(cls, sel)]; e; e = e->next)
-        if (e->cls == cls && e->sel == sel && e->generation == generation)
+    for (ObSend *e = atomic_load(&g_ob_sends[ob_send_hash(cls, sel)]); e;
+         e = atomic_load_explicit(&e->next, memory_order_acquire))
+        if (e->cls == cls && e->sel == sel)
             return e;
     return NULL;
 }
 
-static const ObSend *ob_remember(const ObSend *scratch)
+static const ObSend *ob_cached(void *cls, void *sel)
+{
+    uint64_t generation = atomic_load(&g_ob_generation);
+    ObSend *e = ob_entry(cls, sel);
+    return e && atomic_load(&e->generation) == generation ? e : NULL;
+}
+
+static const ObSend *ob_remember(ObSend *scratch, const char *enc)
 {
     unsigned b = ob_send_hash(scratch->cls, scratch->sel);
-    ObSend *made = malloc(sizeof *made);
+    size_t len = enc ? strlen(enc) + 1 : 0;
+    ObSend *made = malloc(sizeof *made + len);
     if (!made)
         return scratch;
     *made = *scratch;
+    made->enc = NULL;
+    if (len) {
+        char *text = (char *)(made + 1);
+        memcpy(text, enc, len);
+        made->enc = text;
+    }
 
     pthread_mutex_lock(&g_ob_lock);
-    ObSend *found = NULL;
-    for (ObSend *e = g_ob_sends[b]; e && !found; e = e->next)
-        if (e->cls == scratch->cls && e->sel == scratch->sel &&
-            e->generation == scratch->generation)
-            found = e;
-    if (!found) {
-        made->next = g_ob_sends[b];
-        g_ob_sends[b] = made;
+    ObSend *found;
+    ObSend *_Atomic *link = &g_ob_sends[b];
+    ObSend *e = atomic_load(link);
+    for (; e && !(e->cls == scratch->cls && e->sel == scratch->sel);
+         link = &e->next, e = atomic_load_explicit(&e->next, memory_order_acquire))
+        ;
+    if (!e) {
+        made->next = atomic_load(&g_ob_sends[b]);
+        atomic_store(&g_ob_sends[b], made);
         found = made;
-        made = NULL;
+    } else {
+        uint64_t have = atomic_load(&e->generation);
+        if (have == scratch->generation)
+            found = e;
+        else if (have > scratch->generation)
+            found = scratch;
+        else {
+            made->next = atomic_load_explicit(&e->next, memory_order_acquire);
+            atomic_store(link, made);
+            found = made;
+        }
     }
     pthread_mutex_unlock(&g_ob_lock);
-    free(made);
+    if (found != made)
+        free(made);
     return found;
 }
 
@@ -1362,9 +1400,18 @@ static const ObSend *ob_method(void *cls, void *sel, ObSend *scratch)
     void *m = ob_class_getInstanceMethod(cls, sel);
     if (!m)
         return NULL;
-    ob_describe(cls, sel, ob_method_getTypeEncoding(m), "method", scratch);
+    const char *enc = ob_method_getTypeEncoding(m);
+    ObSend *prev = ob_entry(cls, sel);
+    if (prev && enc && prev->enc && strcmp(prev->enc, enc) == 0) {
+        uint64_t cur = atomic_load(&prev->generation);
+        while (cur < generation &&
+               !atomic_compare_exchange_weak(&prev->generation, &cur, generation))
+            ;
+        return prev;
+    }
+    ob_describe(cls, sel, enc, "method", scratch);
     scratch->generation = generation;
-    return ob_remember(scratch);
+    return ob_remember(scratch, enc);
 }
 
 int ocerz_objc_allocateClassPair(struct OcerzVM *vm, OcerzCPU *cpu)
