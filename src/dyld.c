@@ -478,6 +478,15 @@
  * missed, as it does for a flat or weak lookup nothing else answered; before
  * that, no other image's import could bind to the main image at all.
  *
+ * The nlist fallback behind a missed export trie used to strcmp its way
+ * through the whole symbol table on every lookup, and dlsym on the default
+ * handle misses the main image almost every time, as does native dlsym on
+ * every image it passes on the way to a hit.  Each image now builds, on its
+ * first fallback, an open-addressed table of its external section symbols
+ * keyed by name, and the first nlist entry of a name wins exactly as the scan
+ * did.  The table points into the image slice and is only trusted while that
+ * slice is the one it was built from; otherwise the old scan answers.
+ *
  * dladdr names a guest image's symbol from its symbol table, read out of the
  * mapped __LINKEDIT so that the name is guest memory, and an image with none -
  * every synthesized one - from its export trie, walked once into a sorted
@@ -709,6 +718,7 @@ typedef struct DynImage {
     uint64_t file_dev;
     uint64_t file_ino;
     struct SymIndex *symidx;
+    struct SymtabHash *_Atomic symtab_hash;
 } DynImage;
 
 #define DYN_DIMG_MAX 256
@@ -4507,6 +4517,98 @@ uint64_t ocerz_dlopen_from(struct OcerzVM *vm, const char *hostpath, int mode, u
     return r;
 }
 
+typedef struct SymtabHashEntry {
+    uint32_t strx;
+    uint64_t value;
+} SymtabHashEntry;
+
+typedef struct SymtabHash {
+    const uint8_t *slice;
+    uint32_t mask;
+    const char *strs;
+    SymtabHashEntry *ent;
+} SymtabHash;
+
+static int symtab_entry_ok(const uint8_t *e, uint32_t strsize)
+{
+    uint32_t strx = rd32(e);
+    uint8_t ntype = e[4];
+    return !(strx == 0 || strx >= strsize || (ntype & 0x0e) != 0x0e || !(ntype & 0x01));
+}
+
+static SymtabHash *symtab_hash_build(const uint8_t *mh, const uint8_t *nl, uint32_t nsyms,
+                                     const char *strs, uint32_t strsize)
+{
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < nsyms; i++)
+        if (symtab_entry_ok(nl + (uint64_t)i * 16, strsize))
+            count++;
+    uint32_t cap = 64;
+    while (cap < count * 2)
+        cap <<= 1;
+    SymtabHash *hash = calloc(1, sizeof *hash);
+    if (!hash)
+        return NULL;
+    SymtabHashEntry *ent = calloc(cap, sizeof *ent);
+    if (!ent) {
+        free(hash);
+        return NULL;
+    }
+    hash->slice = mh;
+    hash->mask = cap - 1;
+    hash->strs = strs;
+    hash->ent = ent;
+    for (uint32_t i = 0; i < nsyms; i++) {
+        const uint8_t *e = nl + (uint64_t)i * 16;
+        if (!symtab_entry_ok(e, strsize))
+            continue;
+        uint32_t strx = rd32(e);
+        const char *name = strs + strx;
+        uint32_t h = symidx_hash(name) & (cap - 1);
+        for (;;) {
+            SymtabHashEntry *slot = ent + h;
+            if (!slot->strx) {
+                slot->strx = strx;
+                slot->value = rd64(e + 8);
+                break;
+            }
+            if (slot->strx == strx || strcmp(strs + slot->strx, name) == 0)
+                break;
+            h = (h + 1) & (cap - 1);
+        }
+    }
+    return hash;
+}
+
+static void symtab_hash_free(DynImage *img)
+{
+    SymtabHash *hash = img->symtab_hash;
+    if (hash) {
+        img->symtab_hash = NULL;
+        free(hash->ent);
+        free(hash);
+    }
+}
+
+static SymtabHash *symtab_hash_of(DynImage *img, const uint8_t *nl, uint32_t nsyms,
+                                  const char *strs, uint32_t strsize)
+{
+    const uint8_t *mh = img->slice;
+    SymtabHash *hash = atomic_load_explicit(&img->symtab_hash, memory_order_acquire);
+    if (hash)
+        return hash->slice == mh ? hash : NULL;
+    SymtabHash *built = symtab_hash_build(mh, nl, nsyms, strs, strsize);
+    if (!built)
+        return NULL;
+    SymtabHash *expected = NULL;
+    if (atomic_compare_exchange_strong_explicit(&img->symtab_hash, &expected, built,
+                                              memory_order_acq_rel, memory_order_acquire))
+        return built;
+    free(built->ent);
+    free(built);
+    return expected->slice == mh ? expected : NULL;
+}
+
 static uint64_t image_symtab_resolve(DynImage *img, const char *sym)
 {
     const uint8_t *mh = img->slice;
@@ -4527,15 +4629,23 @@ static uint64_t image_symtab_resolve(DynImage *img, const char *sym)
         return 0;
     const uint8_t *nl = mh + symoff;
     const char *strs = (const char *)(mh + stroff);
+    SymtabHash *hash = symtab_hash_of(img, nl, nsyms, strs, strsize);
+    if (hash) {
+        uint32_t h = symidx_hash(sym) & hash->mask;
+        for (;;) {
+            const SymtabHashEntry *slot = hash->ent + h;
+            if (!slot->strx)
+                return 0;
+            if (strcmp(strs + slot->strx, sym) == 0)
+                return slot->value + img->slide;
+            h = (h + 1) & hash->mask;
+        }
+    }
     for (uint32_t i = 0; i < nsyms; i++) {
         const uint8_t *e = nl + (uint64_t)i * 16;
-        uint32_t strx = rd32(e);
-        uint8_t ntype = e[4];
-        if (strx == 0 || strx >= strsize)
+        if (!symtab_entry_ok(e, strsize))
             continue;
-        if ((ntype & 0x0e) != 0x0e || !(ntype & 0x01))
-            continue;
-        if (strcmp(strs + strx, sym) == 0)
+        if (strcmp(strs + rd32(e), sym) == 0)
             return rd64(e + 8) + img->slide;
     }
     return 0;
@@ -5581,6 +5691,7 @@ static void ndl_rollback(int before)
         if (d->map_size)
             ocerz_unmap(d->map_base, d->map_size);
         free(d->owned_buf);
+        symtab_hash_free(d);
         memset(d, 0, sizeof *d);
     }
     g_dimgs_n = before;
@@ -6176,8 +6287,10 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
         ocerz_st(gs - 8, 8, htid);
     }
 
-    if (g_main_dimg_valid)
+    if (g_main_dimg_valid) {
         free(g_main_dimg.owned_buf);
+        symtab_hash_free(&g_main_dimg);
+    }
     g_main_dimg = img;
     g_main_dimg.owned_buf = buf;
     g_main_dimg_valid = 1;
