@@ -1188,11 +1188,6 @@ static int ras_cell_register(void **cell)
     return 1;
 }
 
-/* Every registered RAS cell is also filed under the 512-byte granule of the
-   entry it was given (at emission, at a tcache bind, or when a pending return
-   target arrives), so a retire visits only the granules its code covers,
-   re-checking each cell's current value and dropping entries that have since
-   moved on. */
 #define RAS_GRAN_SHIFT 9
 #define RAS_GRAN_BUCKETS 1024
 typedef struct RasGranEnt {
