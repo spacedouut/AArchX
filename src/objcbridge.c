@@ -329,6 +329,12 @@
  * delivered, which every crossing does last.  A refusal is a line on stderr and
  * OCERZ_BRIDGE_UNIMPL_EXIT, never a call made under a guessed signature.
  * OCERZ_OBJCLOG prints each send's class, selector and notation as it crosses.
+ *
+ * A native IMP handed to the guest is a guest thunk: a page of 16-byte stubs,
+ * each carrying its number in r10 and jumping into the native-IMP trampoline.
+ * A thunk's number is its place in the bound-IMP table, found again through an
+ * open-addressed index of twice the table's size, so asking for a bound IMP
+ * costs a hash probe rather than a walk over every IMP bound before it.
  */
 #include "ocerz/objcbridge.h"
 #include "ocerz/abi.h"
@@ -1928,6 +1934,8 @@ static const ObSend *ob_object_blocks(void *recv, void *cls, void *sel, const Ob
 #define OB_IMP_MAX (OB_IMP_PER_PAGE * OB_IMP_PAGES)
 #define OB_IMP_STRIDE 16u
 #define OB_IMP_SLOT 0x800u
+#define OB_IMP_HASH (OB_IMP_MAX * 2)
+#define OB_IMP_HASH_BITS 14u
 
 typedef struct ObImp {
     void *imp;
@@ -1939,6 +1947,21 @@ static ObImp g_ob_imps[OB_IMP_MAX];
 static _Atomic unsigned g_ob_imps_n;
 static _Atomic uint64_t g_ob_imp_pages[OB_IMP_PAGES];
 static pthread_mutex_t g_ob_imp_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint16_t g_ob_imp_index[OB_IMP_HASH];
+
+_Static_assert(OB_IMP_MAX <= UINT16_MAX && !(OB_IMP_HASH & (OB_IMP_HASH - 1)),
+               "the IMP index holds k+1 in a u16 table whose size is a power of two");
+
+static unsigned ob_imp_find_locked(void *imp)
+{
+    unsigned h = (unsigned)(((uintptr_t)imp >> 2) * 0x9e3779b97f4a7c15ull >> (64 - OB_IMP_HASH_BITS));
+    for (;;) {
+        unsigned at = g_ob_imp_index[h];
+        if (!at || g_ob_imps[at - 1].imp == imp)
+            return h;
+        h = (h + 1) & (OB_IMP_HASH - 1);
+    }
+}
 
 static void *_Atomic g_ob_sel_methodFor;
 static void *_Atomic g_ob_sel_instanceMethodFor;
@@ -2012,10 +2035,10 @@ uint64_t ocerz_objc_imp_for_guest(void *native_imp, const char *types)
     uint64_t answer = 0;
     pthread_mutex_lock(&g_ob_imp_lock);
     unsigned n = atomic_load(&g_ob_imps_n), k;
-    for (k = 0; k < n; k++)
-        if (g_ob_imps[k].imp == native_imp)
-            break;
+    unsigned slot = ob_imp_find_locked(native_imp);
+    k = g_ob_imp_index[slot] ? g_ob_imp_index[slot] - 1 : n;
     if (k == n && n < OB_IMP_MAX) {
+        g_ob_imp_index[slot] = (uint16_t)(n + 1);
         g_ob_imps[n].imp = native_imp;
         g_ob_imps[n].types = types ? strdup(types) : NULL;
         g_ob_imps[n].stret = ob_types_stret(types);
