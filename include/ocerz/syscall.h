@@ -87,6 +87,7 @@ void ocerz_guest_deliver_now(OcerzCPU *cpu, int sig);
 uint32_t ocerz_guest_sigpending(OcerzCPU *cpu);
 int ocerz_guest_sigwait(struct OcerzVM *vm, OcerzCPU *cpu, uint32_t want);
 int ocerz_guest_post_to_waiter(int sig);
+void guest_wait_kick(void);
 int ocerz_guest_pthread_kill(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t thread, int sig);
 int ocerz_guest_thread_port_kill(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t port, int sig, int *err);
 int ocerz_guest_deliver_pending(struct OcerzVM *vm, OcerzCPU *cpu);

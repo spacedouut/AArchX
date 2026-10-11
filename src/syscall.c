@@ -176,6 +176,14 @@
  * kernel could never deliver, so libc returned ENOSYS) and are pinned by the
  * dynamic test signal_wait.
  *
+ * sigsuspend and sigwait park the calling thread on a Mach semaphore that
+ * lives for the length of one wait.  ocerz_guest_post_to_waiter signals it
+ * after setting the pending bit, and the host async-signal and SIGEMT kick
+ * handlers signal it for the thread they run on, so exit and interrupt
+ * requests wake it too.  Each wake rechecks the same pending, exited and
+ * interrupt conditions; the wait also times out after 100 ms as a safety net,
+ * and falls back to the old 2 ms sleep if no semaphore could be created.
+ *
  * A self-directed pthread_kill - the guest's abort()/raise(), and every
  * Chromium CHECK - is delivered to the GUEST rather than forwarded to the host.
  * Forwarding raises a real signal on the ocerz process, so a guest abort became
@@ -4963,18 +4971,24 @@ static int sys_pwritev_nc(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8]) { return sy
 static struct {
     OcerzCPU *cpu;
     uint64_t accept;
+    semaphore_t sem;
 } g_guest_waiters[GUEST_WAITERS];
 static pthread_mutex_t g_guest_waiters_lock = PTHREAD_MUTEX_INITIALIZER;
+static __thread semaphore_t t_guest_wait_sem;
+#define GUEST_WAIT_FALLBACK_NS 100000000
 
-static void guest_waiter(OcerzCPU *cpu, uint64_t accept)
+static void guest_waiter(OcerzCPU *cpu, uint64_t accept, semaphore_t sem)
 {
     pthread_mutex_lock(&g_guest_waiters_lock);
     int free_at = -1;
     for (int k = 0; k < GUEST_WAITERS; k++) {
         if (g_guest_waiters[k].cpu == cpu) {
             g_guest_waiters[k].accept = accept;
-            if (!accept)
+            g_guest_waiters[k].sem = sem;
+            if (!accept) {
                 g_guest_waiters[k].cpu = NULL;
+                g_guest_waiters[k].sem = 0;
+            }
             pthread_mutex_unlock(&g_guest_waiters_lock);
             return;
         }
@@ -4984,6 +4998,7 @@ static void guest_waiter(OcerzCPU *cpu, uint64_t accept)
     if (accept && free_at >= 0) {
         g_guest_waiters[free_at].cpu = cpu;
         g_guest_waiters[free_at].accept = accept;
+        g_guest_waiters[free_at].sem = sem;
     }
     pthread_mutex_unlock(&g_guest_waiters_lock);
 }
@@ -4998,6 +5013,8 @@ int ocerz_guest_post_to_waiter(int sig)
     for (int k = 0; k < GUEST_WAITERS && !posted; k++) {
         if (g_guest_waiters[k].cpu && (g_guest_waiters[k].accept & bit)) {
             __atomic_or_fetch(&g_guest_waiters[k].cpu->sig_pending, bit, __ATOMIC_SEQ_CST);
+            if (g_guest_waiters[k].sem)
+                semaphore_signal(g_guest_waiters[k].sem);
             posted = 1;
         }
     }
@@ -5005,32 +5022,72 @@ int ocerz_guest_post_to_waiter(int sig)
     return posted;
 }
 
-static int guest_suspend_wait(OcerzVM *vm, OcerzCPU *cpu, uint64_t suspend)
+void guest_wait_kick(void)
 {
+    semaphore_t sem = t_guest_wait_sem;
+    if (sem)
+        semaphore_signal(sem);
+}
+
+static void guest_wait_sleep(semaphore_t sem)
+{
+    if (sem) {
+        mach_timespec_t ts = { 0, GUEST_WAIT_FALLBACK_NS };
+        semaphore_timedwait(sem, ts);
+        return;
+    }
+    struct timespec ts = { 0, 2 * 1000 * 1000 };
+    nanosleep(&ts, NULL);
+}
+
+static int guest_block_wait(OcerzVM *vm, OcerzCPU *cpu, int waiter, uint64_t accept,
+                            int has_suspend, uint64_t suspend, uint32_t async_acc,
+                            uint64_t ready_mask, int consume)
+{
+    semaphore_t outer_sem = t_guest_wait_sem;
+    semaphore_t sem = 0;
+    if (semaphore_create(mach_task_self(), &sem, SYNC_POLICY_FIFO, 0) != KERN_SUCCESS)
+        sem = 0;
+    t_guest_wait_sem = sem;
     uint64_t saved = cpu->sig_mask;
-    guest_waiter(cpu, ~suspend & 0xffffffffull);
-    cpu->sig_mask = suspend;
+    if (waiter)
+        guest_waiter(cpu, accept, sem);
+    if (has_suspend)
+        cpu->sig_mask = suspend;
     cpu->block_nokick = 1;
     cpu->block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-    int caught = 0;
+    int got = 0;
     for (;;) {
         __atomic_or_fetch(&cpu->sig_pending,
-                          (uint64_t)(ocerz_take_pending_async_sig_mask(async_accept(suspend)) >> 1),
+                          (uint64_t)(ocerz_take_pending_async_sig_mask(async_acc) >> 1),
                           __ATOMIC_SEQ_CST);
-        uint64_t ready = __atomic_load_n(&cpu->sig_pending, __ATOMIC_SEQ_CST) & ~suspend;
-        if (ready) {
-            caught = __builtin_ctzll(ready) + 1;
+        uint64_t hit = __atomic_load_n(&cpu->sig_pending, __ATOMIC_SEQ_CST) & ready_mask;
+        if (hit) {
+            got = __builtin_ctzll(hit) + 1;
+            if (consume)
+                __atomic_and_fetch(&cpu->sig_pending, ~(1ull << (got - 1)), __ATOMIC_SEQ_CST);
             break;
         }
         if (__atomic_load_n(&vm->exited, __ATOMIC_ACQUIRE) || cpu->interrupt)
             break;
-        struct timespec ts = { 0, 2 * 1000 * 1000 };
-        nanosleep(&ts, NULL);
+        guest_wait_sleep(sem);
     }
-    guest_waiter(cpu, 0);
+    if (waiter)
+        guest_waiter(cpu, 0, 0);
     cpu->block_since_ns = 0;
     cpu->block_nokick = 0;
-    cpu->sig_mask = saved;
+    if (has_suspend)
+        cpu->sig_mask = saved;
+    t_guest_wait_sem = outer_sem;
+    if (sem)
+        semaphore_destroy(mach_task_self(), sem);
+    return got;
+}
+
+static int guest_suspend_wait(OcerzVM *vm, OcerzCPU *cpu, uint64_t suspend)
+{
+    int caught = guest_block_wait(vm, cpu, 1, ~suspend & 0xffffffffull, 1, suspend,
+                                  async_accept(suspend), ~suspend, 0);
     if (caught)
         __atomic_and_fetch(&cpu->sig_pending, ~(1ull << (caught - 1)), __ATOMIC_SEQ_CST);
     return caught;
@@ -5054,55 +5111,14 @@ uint32_t ocerz_guest_sigpending(OcerzCPU *cpu)
 
 int ocerz_guest_sigwait(struct OcerzVM *vm, OcerzCPU *cpu, uint32_t want)
 {
-    guest_waiter(cpu, want);
-    cpu->block_nokick = 1;
-    cpu->block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-    int got = 0;
-    for (;;) {
-        __atomic_or_fetch(&cpu->sig_pending,
-                          (uint64_t)(ocerz_take_pending_async_sig_mask(want << 1) >> 1), __ATOMIC_SEQ_CST);
-        uint32_t hit = (uint32_t)__atomic_load_n(&cpu->sig_pending, __ATOMIC_SEQ_CST) & want;
-        if (hit) {
-            got = __builtin_ctz(hit) + 1;
-            __atomic_and_fetch(&cpu->sig_pending, ~(1ull << (got - 1)), __ATOMIC_SEQ_CST);
-            break;
-        }
-        if (__atomic_load_n(&vm->exited, __ATOMIC_ACQUIRE) || cpu->interrupt)
-            break;
-        struct timespec ts = { 0, 2 * 1000 * 1000 };
-        nanosleep(&ts, NULL);
-    }
-    guest_waiter(cpu, 0);
-    cpu->block_since_ns = 0;
-    cpu->block_nokick = 0;
-    return got;
+    return guest_block_wait(vm, cpu, 1, want, 0, 0, want << 1, want, 1);
 }
 
 static int sys_sigsuspend(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
-    uint64_t saved = cpu->sig_mask;
     uint64_t suspend = (uint32_t)a[0];
-    cpu->sig_mask = suspend;
-    cpu->block_nokick = 1;
-    cpu->block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-    int caught = 0;
-    for (;;) {
-        __atomic_or_fetch(&cpu->sig_pending,
-                          (uint64_t)(ocerz_take_pending_async_sig_mask(async_accept(suspend)) >> 1),
-                          __ATOMIC_SEQ_CST);
-        uint64_t ready = __atomic_load_n(&cpu->sig_pending, __ATOMIC_SEQ_CST) & ~suspend;
-        if (ready) {
-            caught = __builtin_ctzll(ready) + 1;
-            break;
-        }
-        if (__atomic_load_n(&vm->exited, __ATOMIC_ACQUIRE) || cpu->interrupt)
-            break;
-        struct timespec ts = { 0, 2 * 1000 * 1000 };
-        nanosleep(&ts, NULL);
-    }
-    cpu->block_since_ns = 0;
-    cpu->block_nokick = 0;
-    cpu->sig_mask = saved;
+    int caught = guest_block_wait(vm, cpu, 0, 0, 1, suspend,
+                                  async_accept(suspend), ~suspend, 0);
     ret_err(cpu, 4);
     if (caught) {
         __atomic_and_fetch(&cpu->sig_pending, ~(1ull << (caught - 1)), __ATOMIC_SEQ_CST);
@@ -5116,25 +5132,7 @@ static int sys_sigwait(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     uint64_t setp = a[0], sigp = a[1];
     uint32_t want = setp ? (uint32_t)ocerz_ld(setp, 4) : 0;
-    cpu->block_nokick = 1;
-    cpu->block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-    int got = 0;
-    for (;;) {
-        __atomic_or_fetch(&cpu->sig_pending,
-                          (uint64_t)(ocerz_take_pending_async_sig_mask(want << 1) >> 1), __ATOMIC_SEQ_CST);
-        uint32_t hit = (uint32_t)__atomic_load_n(&cpu->sig_pending, __ATOMIC_SEQ_CST) & want;
-        if (hit) {
-            got = __builtin_ctz(hit) + 1;
-            __atomic_and_fetch(&cpu->sig_pending, ~(1ull << (got - 1)), __ATOMIC_SEQ_CST);
-            break;
-        }
-        if (__atomic_load_n(&vm->exited, __ATOMIC_ACQUIRE) || cpu->interrupt)
-            break;
-        struct timespec ts = { 0, 2 * 1000 * 1000 };
-        nanosleep(&ts, NULL);
-    }
-    cpu->block_since_ns = 0;
-    cpu->block_nokick = 0;
+    int got = guest_block_wait(vm, cpu, 0, 0, 0, 0, want << 1, want, 1);
     if (!got) {
         ret_err(cpu, 4);
         return OCERZ_STEP_OK;
