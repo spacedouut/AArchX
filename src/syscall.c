@@ -962,7 +962,7 @@ static int guest_mprotect_apply(OcerzVM *vm, OcerzCPU *cpu, uint64_t addr, uint6
         ocerz_jit_require_ordered(vm);
     invalidate_guest_mapping(vm, addr, len);
     int rc = ocerz_protect(addr, len, prot);
-    if (rc != OCERZ_OK && getenv("OCERZ_MAPFAILLOG"))
+    if (rc != OCERZ_OK && ENV_SET("OCERZ_MAPFAILLOG"))
         fprintf(stderr, "ocerz: PROTFAIL[%d] addr=%#llx len=%#llx prot=%#x rc=%d rip=%#llx\n", (int)getpid(),
                 (unsigned long long)addr, (unsigned long long)len, (unsigned)prot, rc, (unsigned long long)cpu->rip);
     if (rc == OCERZ_OK)
@@ -3811,7 +3811,7 @@ static int sys_kevent_id(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
             ret_ok(cpu, r);
         return OCERZ_STEP_OK;
     }
-    if (getenv("OCERZ_KEVENT_WORKER")) {
+    if (ENV_SET("OCERZ_KEVENT_WORKER")) {
         uint64_t changelist = a[1];
         int nchanges = (int)a[2];
         if (nchanges > 0 && changelist != 0 &&
@@ -3838,7 +3838,7 @@ static int sys_kevent_qos(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
 
     uint64_t kq_flags = ocerz_ld(cpu->gpr[OCERZ_RSP] + 16, 8);
-    if (getenv("OCERZ_MGRPROBE") && (kq_flags & 0x20ull)) {
+    if (ENV_SET("OCERZ_MGRPROBE") && (kq_flags & 0x20ull)) {
 
         int nch = (int)a[2]; uint64_t cl = a[1];
         fprintf(stderr, "ocerz: KQWORKQ[%d] flags=%#llx nchg=%d nev=%lld",
@@ -4240,7 +4240,7 @@ static int sys_pthread_kill(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     uint64_t signo = a[1];
 
-    if (getenv("OCERZ_PTKILL")) {
+    if (ENV_SET("OCERZ_PTKILL")) {
         uint64_t selfport = ocerz_host_mach_trap(27, a);
         fprintf(stderr, "ocerz: PTKILL[%d] target=%#llx signo=%llu self=%#llx cross=%d handler=%#llx\n",
                 (int)getpid(), (unsigned long long)a[0], (unsigned long long)signo,
@@ -4654,7 +4654,7 @@ static int sys_sigreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         cpu->fs_base = ocerz_ld(uc + 64, 8);
         ocerz_st(uc + 72, 8, 0);
     }
-    if (getenv("OCERZ_GSTRACE"))
+    if (ENV_SET("OCERZ_GSTRACE"))
         fprintf(stderr,
                 "ocerz: GS sigreturn[%d] cpu#%u gs %#llx rip=%#llx%s\n",
                 (int)getpid(), cpu->cpu_number,

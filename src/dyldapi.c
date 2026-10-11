@@ -118,6 +118,7 @@
 #include <mach-o/nlist.h>
 
 #define DYLDAPI_VTABLE_SIZE 0x2000
+#define ENV_SET(name) ({ static int set_ = -1; if (set_ < 0) set_ = getenv(name) != NULL; set_; })
 
 #define PRELOAD_MAX 8192
 
@@ -1714,7 +1715,7 @@ static uint64_t selpool_canonical(const char *want)
         return 0;
     if (g_selopt) {
         uint64_t r = selopt_canonical(want);
-        if (getenv("OCERZ_SELVERIFY") && g_sel_pool) {
+        if (ENV_SET("OCERZ_SELVERIFY") && g_sel_pool) {
             if (!g_selidx) selpool_build();
             uint64_t b = 0;
             if (g_selidx) {
@@ -2474,7 +2475,7 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
         if (pathg) {
             const char *host = (const char *)ocerz_g2h(pathg);
             ok = cache_find_canonical(host, NULL) != 0 || access(host, R_OK) == 0;
-            if (getenv("OCERZ_DLPATH"))
+            if (ENV_SET("OCERZ_DLPATH"))
                 fprintf(stderr, "ocerz: dlopen_preflight(\"%s\") -> %llu\n",
                         host, (unsigned long long)ok);
         }
@@ -2487,7 +2488,7 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
         uint64_t addr = 0;
         if (symg)
             addr = ocerz_dlsym(handle, (const char *)ocerz_g2h(symg));
-        if (getenv("OCERZ_DLSYMLOG"))
+        if (ENV_SET("OCERZ_DLSYMLOG"))
             fprintf(stderr, "ocerz: DLSYM[%d] handle=%#llx \"%s\" -> %#llx caller=%#llx\n", (int)getpid(),
                     (unsigned long long)handle, symg ? (const char *)ocerz_g2h(symg) : "(null)",
                     (unsigned long long)addr,
@@ -2606,12 +2607,12 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
             ocerz_st(info + 0x10, 8, eh ? eh_sz : 0);
             ocerz_st(info + 0x18, 8, cu);
             ocerz_st(info + 0x20, 8, cu ? cu_sz : 0);
-            if (getenv("OCERZ_UNWLOG"))
+            if (ENV_SET("OCERZ_UNWLOG"))
                 fprintf(stderr, "ocerz: UNWLOG pc=%#llx mh=%#llx eh=%#llx eh_sz=%#llx cu=%#llx cu_sz=%#llx\n",
                         (unsigned long long)pc, (unsigned long long)mh,
                         (unsigned long long)eh, (unsigned long long)eh_sz,
                         (unsigned long long)cu, (unsigned long long)cu_sz);
-        } else if (getenv("OCERZ_UNWLOG")) {
+        } else if (ENV_SET("OCERZ_UNWLOG")) {
             fprintf(stderr, "ocerz: UNWLOG pc=%#llx mh=0 (no image)\n", (unsigned long long)pc);
         }
         api_return(cpu, mh ? 1 : 0);
@@ -2682,7 +2683,7 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
         if (mh && (is_swift_kind || is_load_marker || is_late_catlist || mh < g_cache_start) &&
             kind < (sizeof kindsect / sizeof kindsect[0]) && kindsect[kind])
             addr = find_section_sz(mh, kindsect[kind], &size);
-        if (getenv("OCERZ_SECLOG"))
+        if (ENV_SET("OCERZ_SECLOG"))
             fprintf(stderr, "ocerz: SECINFO mh=%#llx kind=%llu (%s) -> addr=%#llx size=%#llx\n",
                     (unsigned long long)mh, (unsigned long long)kind,
                     (kind < (sizeof kindsect / sizeof kindsect[0]) && kindsect[kind]) ? kindsect[kind] : "?",
@@ -2704,7 +2705,7 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
     case 0x2a0: {
         uint64_t name = cpu->gpr[OCERZ_RSI];
         uint64_t result = name ? selpool_canonical((const char *)ocerz_g2h(name)) : 0;
-        if (!result && name && getenv("OCERZ_SELLOG"))
+        if (!result && name && ENV_SET("OCERZ_SELLOG"))
             fprintf(stderr, "ocerz: SELMISS \"%s\"\n", (const char *)ocerz_g2h(name));
         api_return(cpu, result);
         return OCERZ_STEP_OK;
