@@ -10,7 +10,13 @@
  * wrong version.  In the export trie, a terminal size of 0 with the name fully
  * consumed is not a miss: the node carries an empty edge to the terminal child,
  * which happens whenever a symbol is a strict prefix of others (_libiconv
- * versus _libiconv_open), so the search falls through to the child.
+ * versus _libiconv_open), so the search falls through to the child.  Each
+ * fixup pass resolves a library ordinal to its dependency image once, through
+ * a per-pass table over the image's dylib load commands, instead of scanning
+ * every loaded image by name for every import.  An entry is reused only while
+ * g_dimgs_gen still matches; it moves whenever an image is registered, gains
+ * an rpath alias or is dropped, so an image loaded in the middle of a pass is
+ * seen exactly as the per-import scan saw it.
  *
  * Real dyld maps each segment with its initprot; this one maps every image
  * read-write so the copy and the fixups can land, then gives __TEXT its real
@@ -25,7 +31,11 @@
  * any dylib, and the cache path followed upward links, so CoreFoundation's
  * handle found OpenGL's glBegin by way of Foundation.  A cache image met on the
  * way hands its own closure to ocerz_cache_dlsym_image.  OCERZ_NO_DLSYM_DEPS
- * restores the image-only search for disk images.
+ * restores the image-only search for disk images.  In native mode that
+ * breadth-first order depends only on the image and the published count, as a
+ * published image never changes its names or leaves, so it is built once per
+ * (image, published count) under g_ndl_deps_lock and every later dlsym on the
+ * handle runs only the symbol lookups.
  *
  * ---- the initial stack ----
  * Every argument and environment entry goes onto the guest stack, counted first
@@ -726,6 +736,7 @@ static DynImage g_dimgs[DYN_DIMG_MAX];
 static int g_dimgs_n;
 static DynImage g_main_dimg;
 static int g_main_dimg_valid;
+static uint32_t g_dimgs_gen = 1;
 /* the main executable while it and its disk dylibs are bound, before g_main_dimg holds it */
 static DynImage *g_main_loading;
 static char g_main_hostpath[1024];
@@ -769,6 +780,12 @@ static DynImage *dimg_find_by_install_name(const char *iname)
             (g_dimgs[i].rpath_name[0] && strcmp(g_dimgs[i].rpath_name, iname) == 0))
             return &g_dimgs[i];
     return NULL;
+}
+
+static void dimg_registry_changed(void)
+{
+    if (++g_dimgs_gen == 0)
+        g_dimgs_gen = 1;
 }
 
 static void dimg_record_id(DynImage *d)
@@ -1637,8 +1654,89 @@ static uint64_t native_missing_stub(const char *name, const char *lib)
     return v;
 }
 
-static uint64_t resolve_import(OcerzCache *cache, DynImage *img, const char *name,
-                               int libord, int weak)
+typedef struct OrdDep {
+    const char *name;
+    uint32_t seen;
+    DynImage *dep;
+} OrdDep;
+
+typedef struct OrdDeps {
+    int n;
+    OrdDep *ent;
+} OrdDeps;
+
+static OrdDeps ord_deps_new(DynImage *img)
+{
+    const uint8_t *mh = img->slice;
+    uint32_t ncmds = rd32(mh + 16);
+    const uint8_t *lc = mh + sizeof(struct mach_header_64);
+    int n = 0;
+    for (uint32_t i = 0; i < ncmds; i++) {
+        uint32_t cmd = rd32(lc);
+        if (cmd == LC_LOAD_DYLIB || cmd == LC_LOAD_WEAK_DYLIB || cmd == LC_REEXPORT_DYLIB ||
+            cmd == LC_LOAD_UPWARD_DYLIB)
+            n++;
+        lc += rd32(lc + 4);
+    }
+    OrdDep *ent = n ? calloc(n, sizeof *ent) : NULL;
+    if (!ent)
+        return (OrdDeps){ 0, NULL };
+    lc = mh + sizeof(struct mach_header_64);
+    int k = 0;
+    for (uint32_t i = 0; i < ncmds; i++) {
+        uint32_t cmd = rd32(lc);
+        if (cmd == LC_LOAD_DYLIB || cmd == LC_LOAD_WEAK_DYLIB || cmd == LC_REEXPORT_DYLIB ||
+            cmd == LC_LOAD_UPWARD_DYLIB)
+            ent[k++].name = (const char *)(lc + rd32(lc + 8));
+        lc += rd32(lc + 4);
+    }
+    return (OrdDeps){ n, ent };
+}
+
+static void ord_deps_free(OrdDeps *deps)
+{
+    free(deps->ent);
+    deps->ent = NULL;
+    deps->n = 0;
+}
+
+static DynImage *ordinal_dep_lookup(DynImage *img, const char *tgt)
+{
+    DynImage *dep = dimg_find_by_install_name(tgt);
+    if (!dep)
+        dep = dimg_find_by_path(tgt);
+    if (!dep && tgt[0] == '@') {
+        char ex[1024];
+        if (expand_at_prefix(img, tgt, ex, sizeof ex)) {
+            dep = dimg_find_by_path(ex);
+            if (!dep)
+                dep = dimg_find_by_install_name(ex);
+        }
+    }
+    return dep;
+}
+
+static const char *ordinal_dep(DynImage *img, OrdDeps *deps, int libord, DynImage **dep)
+{
+    if (!deps || !deps->ent) {
+        const char *tgt = dimg_ordinal_name(img, libord);
+        if (tgt)
+            *dep = ordinal_dep_lookup(img, tgt);
+        return tgt;
+    }
+    if (libord > deps->n)
+        return NULL;
+    OrdDep *e = deps->ent + libord - 1;
+    if (e->seen != g_dimgs_gen) {
+        e->dep = ordinal_dep_lookup(img, e->name);
+        e->seen = g_dimgs_gen;
+    }
+    *dep = e->dep;
+    return e->name;
+}
+
+static uint64_t resolve_import(OcerzCache *cache, DynImage *img, OrdDeps *deps,
+                               const char *name, int libord, int weak)
 {
 
     uint64_t value = 0;
@@ -1646,19 +1744,9 @@ static uint64_t resolve_import(OcerzCache *cache, DynImage *img, const char *nam
     int virtual_dep = 0;
     const char *tgt = NULL;
     if (libord > 0) {
-        tgt = dimg_ordinal_name(img, libord);
+        DynImage *dep = NULL;
+        tgt = ordinal_dep(img, deps, libord, &dep);
         if (tgt) {
-            DynImage *dep = dimg_find_by_install_name(tgt);
-            if (!dep)
-                dep = dimg_find_by_path(tgt);
-            if (!dep && tgt[0] == '@') {
-                char ex[1024];
-                if (expand_at_prefix(img, tgt, ex, sizeof ex)) {
-                    dep = dimg_find_by_path(ex);
-                    if (!dep)
-                        dep = dimg_find_by_install_name(ex);
-                }
-            }
             if (dep) {
                 native_guest_runtime_for(cache, img, dep, name);
                 value = ocerz_image_self_resolve_ex(dep, name, &found);
@@ -1867,6 +1955,7 @@ static int apply_fixups(DynImage *img, OcerzCache *cache)
     uint8_t *idone = ivals ? (uint8_t *)calloc(imports_cnt, 1) : NULL;
     if (ivals && !idone) { free(ivals); ivals = NULL; }
 
+    OrdDeps deps = ord_deps_new(img);
     const uint8_t *sii = cf + starts_off;
     uint32_t seg_count = rd32(sii);
     for (uint32_t s = 0; s < seg_count; s++) {
@@ -1881,7 +1970,7 @@ static int apply_fixups(DynImage *img, OcerzCache *cache)
         const uint8_t *page_start = sis + 0x16;
         if (ptr_format != 2 && ptr_format != 6) {
             OCERZ_FATAL("unsupported chained pointer format %u\n", ptr_format);
-            { free(ivals); free(idone); return OCERZ_EUNSUP; }
+            { free(ivals); free(idone); ord_deps_free(&deps); return OCERZ_EUNSUP; }
         }
         for (uint16_t pg = 0; pg < page_count; pg++) {
             uint16_t start = rd16(page_start + pg * 2);
@@ -1905,7 +1994,7 @@ static int apply_fixups(DynImage *img, OcerzCache *cache)
                         if (idone && idone[ordinal]) {
                             value = ivals[ordinal];
                         } else {
-                            value = resolve_import(cache, img, name, libord, weakimp);
+                            value = resolve_import(cache, img, &deps, name, libord, weakimp);
                             if (idone) { ivals[ordinal] = value; idone[ordinal] = 1; }
                         }
                     }
@@ -1925,7 +2014,7 @@ static int apply_fixups(DynImage *img, OcerzCache *cache)
             }
         }
     }
-    { free(ivals); free(idone); return OCERZ_OK; }
+    { free(ivals); free(idone); ord_deps_free(&deps); return OCERZ_OK; }
 }
 
 static int64_t self_sleb(const uint8_t **pp, const uint8_t *end)
@@ -1952,11 +2041,11 @@ typedef struct {
 } ClassicMemo;
 
 static uint64_t classic_resolve(DynImage *img, OcerzCache *cache, const char *name,
-                                int libord, int weak, ClassicMemo *m)
+                                int libord, int weak, ClassicMemo *m, OrdDeps *deps)
 {
     if (m->valid && name == m->name && libord == m->libord && weak == m->weak)
         return m->value;
-    uint64_t v = resolve_import(cache, img, name, libord, weak);
+    uint64_t v = resolve_import(cache, img, deps, name, libord, weak);
     m->name = name;
     m->libord = libord;
     m->weak = weak;
@@ -2123,7 +2212,7 @@ static void flat_flush(OcerzCache *cache)
     g_flat_defer = 0;
     for (size_t i = 0; i < g_flat_pending_n; i++) {
         FlatPending *f = &g_flat_pending[i];
-        uint64_t v = resolve_import(cache, f->img, f->name, BIND_SPECIAL_DYLIB_FLAT_LOOKUP, 0);
+        uint64_t v = resolve_import(cache, f->img, NULL, f->name, BIND_SPECIAL_DYLIB_FLAT_LOOKUP, 0);
         ocerz_st(f->addr, 8, v ? v + (uint64_t)f->addend : 0);
     }
     free(g_flat_pending);
@@ -2139,7 +2228,8 @@ static void flat_flush(OcerzCache *cache)
  * 1,743 of them, 621 ms, in ffmpeg -version.
  */
 static void classic_bind_stream(DynImage *img, OcerzCache *cache,
-                                const uint8_t *p, const uint8_t *end, int is_lazy, int weak_stream)
+                                const uint8_t *p, const uint8_t *end, int is_lazy, int weak_stream,
+                                OrdDeps *deps)
 {
     ClassicMemo memo = { 0 };
     uint64_t addr = 0;
@@ -2196,19 +2286,19 @@ static void classic_bind_stream(DynImage *img, OcerzCache *cache,
                 addr += 8;
                 break;
             }
-            uint64_t v = classic_resolve(img, cache, name, libord, weak, &memo);
+            uint64_t v = classic_resolve(img, cache, name, libord, weak, &memo, deps);
             ocerz_st(addr, 8, v ? v + (uint64_t)addend : 0);
             addr += 8;
             break;
         }
         case 0xa0: {
-            uint64_t v = classic_resolve(img, cache, name, libord, weak, &memo);
+            uint64_t v = classic_resolve(img, cache, name, libord, weak, &memo, deps);
             ocerz_st(addr, 8, v ? v + (uint64_t)addend : 0);
             addr += 8 + self_uleb(&p, end);
             break;
         }
         case 0xb0: {
-            uint64_t v = classic_resolve(img, cache, name, libord, weak, &memo);
+            uint64_t v = classic_resolve(img, cache, name, libord, weak, &memo, deps);
             ocerz_st(addr, 8, v ? v + (uint64_t)addend : 0);
             addr += 8 + (uint64_t)imm * 8;
             break;
@@ -2217,7 +2307,7 @@ static void classic_bind_stream(DynImage *img, OcerzCache *cache,
             uint64_t cnt = self_uleb(&p, end);
             uint64_t skip = self_uleb(&p, end);
             for (uint64_t i = 0; i < cnt; i++) {
-                uint64_t v = classic_resolve(img, cache, name, libord, weak, &memo);
+                uint64_t v = classic_resolve(img, cache, name, libord, weak, &memo, deps);
                 ocerz_st(addr, 8, v ? v + (uint64_t)addend : 0);
                 addr += 8 + skip;
             }
@@ -2243,7 +2333,7 @@ static int legacy_ordinal(const DynImage *img, uint16_t n_desc)
 
 static uint64_t legacy_symbol(DynImage *img, OcerzCache *cache, const uint8_t *syms,
                               uint32_t nsyms, const char *strs, uint32_t strsize,
-                              uint32_t index)
+                              uint32_t index, OrdDeps *deps)
 {
     if (index >= nsyms)
         return 0;
@@ -2258,7 +2348,7 @@ static uint64_t legacy_symbol(DynImage *img, OcerzCache *cache, const uint8_t *s
         return value;
     if (strx >= strsize)
         return 0;
-    return resolve_import(cache, img, strs + strx, legacy_ordinal(img, desc),
+    return resolve_import(cache, img, deps, strs + strx, legacy_ordinal(img, desc),
                           (desc & N_WEAK_REF) != 0);
 }
 
@@ -2286,6 +2376,7 @@ static int apply_legacy_relocations(DynImage *img, OcerzCache *cache)
     }
     if (!symtab || !dysymtab)
         return OCERZ_OK;
+    OrdDeps deps = ord_deps_new(img);
     const uint8_t *syms = h + rd32(symtab + 8);
     uint32_t nsyms = rd32(symtab + 12);
     const char *strs = (const char *)h + rd32(symtab + 16);
@@ -2311,7 +2402,7 @@ static int apply_legacy_relocations(DynImage *img, OcerzCache *cache)
         if (((info >> 25) & 3) != 3 || ((info >> 24) & 1) || !((info >> 27) & 1) || (info >> 28))
             continue;
         uint64_t at = reloc_base + (int64_t)addr;
-        uint64_t target = legacy_symbol(img, cache, syms, nsyms, strs, strsize, info & 0xffffff);
+        uint64_t target = legacy_symbol(img, cache, syms, nsyms, strs, strsize, info & 0xffffff, &deps);
         ocerz_st(at, 8, ocerz_ld(at, 8) + target);
     }
     lc = h + sizeof(struct mach_header_64);
@@ -2335,12 +2426,13 @@ static int apply_legacy_relocations(DynImage *img, OcerzCache *cache)
                     if (index == INDIRECT_SYMBOL_LOCAL)
                         ocerz_st(at, 8, ocerz_ld(at, 8) + img->slide);
                     else
-                        ocerz_st(at, 8, legacy_symbol(img, cache, syms, nsyms, strs, strsize, index));
+                        ocerz_st(at, 8, legacy_symbol(img, cache, syms, nsyms, strs, strsize, index, &deps));
                 }
             }
         }
         lc += size;
     }
+    ord_deps_free(&deps);
     return OCERZ_OK;
 }
 
@@ -2357,16 +2449,18 @@ static int apply_classic_fixups(DynImage *img, OcerzCache *cache)
     if (!img->has_dyld_info)
         return apply_legacy_relocations(img, cache);
     classic_rebase(img);
+    OrdDeps deps = ord_deps_new(img);
     if (img->bind_size)
         classic_bind_stream(img, cache, img->slice + img->bind_off,
-                            img->slice + img->bind_off + img->bind_size, 0, 0);
+                            img->slice + img->bind_off + img->bind_size, 0, 0, &deps);
     if (img->weak_bind_size)
         classic_bind_stream(img, cache, img->slice + img->weak_bind_off,
                             img->slice + img->weak_bind_off + img->weak_bind_size, 0,
-                            weak_stream_enabled());
+                            weak_stream_enabled(), &deps);
     if (img->lazy_bind_size)
         classic_bind_stream(img, cache, img->slice + img->lazy_bind_off,
-                            img->slice + img->lazy_bind_off + img->lazy_bind_size, 1, 0);
+                            img->slice + img->lazy_bind_off + img->lazy_bind_size, 1, 0, &deps);
+    ord_deps_free(&deps);
     return OCERZ_OK;
 }
 
@@ -3904,10 +3998,12 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
         snprintf(v->path, sizeof v->path, "%s", install_name);
         snprintf(v->install_name, sizeof v->install_name, "%s", install_name);
         dimg_record_id(v);
+        dimg_registry_changed();
         if (map_segments(v, 0) != OCERZ_OK) {
             OCERZ_FATAL("cannot map segments of virtual %s\n", install_name);
             native_dl_reason("its synthesized image could not be mapped", NULL);
             g_dimgs_n--;
+            dimg_registry_changed();
             free(vbuf);
             return NULL;
         }
@@ -3930,8 +4026,10 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
     }
     if (ocerz_mode == OCERZ_MODE_NATIVE && install_name[0] == '@' && access(resolved, F_OK) != 0) {
         DynImage *d = load_disk_dylib(cache, resolved, loader, rpaths);
-        if (d && !d->rpath_name[0])
+        if (d && !d->rpath_name[0]) {
             snprintf(d->rpath_name, sizeof d->rpath_name, "%s", install_name);
+            dimg_registry_changed();
+        }
         return d;
     }
     if (dep_find(cache, resolved) != 0)
@@ -3992,11 +4090,13 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
     d->file_dev = fdev;
     d->file_ino = fino;
     dimg_record_id(d);
+    dimg_registry_changed();
 
     if (map_segments(d, 0) != OCERZ_OK) {
         OCERZ_FATAL("cannot map segments of %s\n", resolved);
         native_dl_reason("its segments could not be mapped", NULL);
         g_dimgs_n--;
+        dimg_registry_changed();
         free(buf);
         return NULL;
     }
@@ -4106,9 +4206,11 @@ static DynImage *dlopen_load_image(OcerzCache *cache, const char *install_path)
     snprintf(d->install_name, sizeof d->install_name, "%s", install_path);
     file_identity(install_path, &d->file_dev, &d->file_ino);
     dimg_record_id(d);
+    dimg_registry_changed();
     if (map_segments(d, 0) != OCERZ_OK) {
         dlerror_set("dlopen(%s): cannot map segments", install_path);
         g_dimgs_n--;
+        dimg_registry_changed();
         free(buf);
         return NULL;
     }
@@ -5098,17 +5200,21 @@ static DynImage *ndl_dep_of(DynImage *img, const char *name, int pub)
     return NULL;
 }
 
-static uint64_t ndl_search_deps(DynImage *root, const char *usym, int *found)
+typedef struct NdlDeps {
+    int published;
+    int n;
+    DynImage *order[DYN_DIMG_MAX + 1];
+} NdlDeps;
+
+static NdlDeps *g_ndl_deps[DYN_DIMG_MAX];
+static pthread_mutex_t g_ndl_deps_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int ndl_dep_order(DynImage *root, int pub, DynImage **queue)
 {
-    int pub = ndl_pub();
-    DynImage *queue[DYN_DIMG_MAX + 1];
     int qn = 0;
     queue[qn++] = root;
     for (int qi = 0; qi < qn; qi++) {
         DynImage *d = queue[qi];
-        uint64_t v = ndl_lookup_in(d, usym, found);
-        if (*found)
-            return v;
         const uint8_t *mh = d->slice;
         uint32_t ncmds = rd32(mh + 16);
         const uint8_t *lc = mh + sizeof(struct mach_header_64);
@@ -5126,6 +5232,47 @@ static uint64_t ndl_search_deps(DynImage *root, const char *usym, int *found)
             }
             lc += rd32(lc + 4);
         }
+    }
+    return qn;
+}
+
+static int ndl_deps_of(DynImage *root, DynImage **queue)
+{
+    int pub = ndl_pub();
+    uintptr_t rel = (uintptr_t)root - (uintptr_t)g_dimgs;
+    int idx = rel % sizeof(DynImage) == 0 ? (int)(rel / sizeof(DynImage)) : -1;
+    if (idx < 0 || idx >= DYN_DIMG_MAX)
+        return ndl_dep_order(root, pub, queue);
+    pthread_mutex_lock(&g_ndl_deps_lock);
+    NdlDeps *e = g_ndl_deps[idx];
+    if (!e && (e = malloc(sizeof *e))) {
+        e->published = -1;
+        e->n = 0;
+        g_ndl_deps[idx] = e;
+    }
+    int n;
+    if (!e)
+        n = ndl_dep_order(root, pub, queue);
+    else {
+        if (e->published != pub) {
+            e->n = ndl_dep_order(root, pub, e->order);
+            e->published = pub;
+        }
+        memcpy(queue, e->order, (size_t)e->n * sizeof *queue);
+        n = e->n;
+    }
+    pthread_mutex_unlock(&g_ndl_deps_lock);
+    return n;
+}
+
+static uint64_t ndl_search_deps(DynImage *root, const char *usym, int *found)
+{
+    DynImage *order[DYN_DIMG_MAX + 1];
+    int n = ndl_deps_of(root, order);
+    for (int i = 0; i < n; i++) {
+        uint64_t v = ndl_lookup_in(order[i], usym, found);
+        if (*found)
+            return v;
     }
     *found = 0;
     return 0;
@@ -5654,9 +5801,11 @@ static DynImage *ndl_load_file(NdlTarget *t, const RpathList *chain)
     snprintf(d->install_name, sizeof d->install_name, "%s", t->path);
     file_identity(t->path, &d->file_dev, &d->file_ino);
     dimg_record_id(d);
+    dimg_registry_changed();
     if (map_segments(d, 0) != OCERZ_OK) {
         native_dl_reason("its segments could not be mapped", NULL);
         g_dimgs_n--;
+        dimg_registry_changed();
         free(d->owned_buf);
         memset(d, 0, sizeof *d);
         return NULL;
@@ -5695,6 +5844,7 @@ static void ndl_rollback(int before)
         memset(d, 0, sizeof *d);
     }
     g_dimgs_n = before;
+    dimg_registry_changed();
 }
 
 static uint64_t *g_ndl_add_funcs;
