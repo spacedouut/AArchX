@@ -556,6 +556,17 @@
  * thread that is itself inside translated code never flushes.
  * OCERZ_NO_JIT_FLUSH=1 keeps the old behaviour.
  *
+ * Retiring one block clears the return-address cells that predict a return
+ * into it.  Walking every registered cell for that held the JIT lock for time
+ * proportional to all the code translated since the last flush, so each cell
+ * is also filed under the 512-byte granule of the entry it was given (at
+ * emission, at a tcache bind, or when a pending return target arrives), and a
+ * retire visits only the granules its code covers, re-checking each cell's
+ * current value and dropping entries that have since moved on.  Cells are code
+ * words, so the only writers are those three and the clears; slots are data and
+ * are still walked.  The index is emptied with the cells: at a flush, when all
+ * code is invalidated, and abandoned unfreed in a fork child.
+ *
  * ---- faults and fork ----
  * A fault inside a block reconstructs the guest state from the host registers:
  * a push whose store faulted has already decremented rsp in its host register
@@ -1165,15 +1176,119 @@ static void psc_clear_all(void)
 }
 static void ***g_ras_cells;
 static size_t g_n_ras_cells, g_cap_ras_cells;
-static void ras_cell_register(void **cell)
+static int ras_cell_register(void **cell)
 {
     if (g_n_ras_cells == g_cap_ras_cells) {
         size_t ncap = g_cap_ras_cells ? g_cap_ras_cells * 2 : 1024;
         void ***nv = (void ***)realloc(g_ras_cells, ncap * sizeof *nv);
-        if (!nv) return;
+        if (!nv) return 0;
         g_ras_cells = nv; g_cap_ras_cells = ncap;
     }
     g_ras_cells[g_n_ras_cells++] = cell;
+    return 1;
+}
+
+/* Every registered RAS cell is also filed under the 512-byte granule of the
+   entry it was given (at emission, at a tcache bind, or when a pending return
+   target arrives), so a retire visits only the granules its code covers,
+   re-checking each cell's current value and dropping entries that have since
+   moved on. */
+#define RAS_GRAN_SHIFT 9
+#define RAS_GRAN_BUCKETS 1024
+typedef struct RasGranEnt {
+    uint64_t gran;
+    void ***cells;
+    size_t n, cap;
+    struct RasGranEnt *next;
+} RasGranEnt;
+static RasGranEnt *g_ras_by_gran[RAS_GRAN_BUCKETS];
+
+static unsigned ras_gran_bucket(uint64_t g)
+{
+    return (unsigned)((g * 0x9e3779b97f4a7c15ull) >> 54);
+}
+
+static void ras_cell_note(void **cell, void *value)
+{
+    if (!value)
+        return;
+    uint64_t g = (uintptr_t)value >> RAS_GRAN_SHIFT;
+    unsigned b = ras_gran_bucket(g);
+    RasGranEnt *e;
+    for (e = g_ras_by_gran[b]; e; e = e->next)
+        if (e->gran == g)
+            break;
+    if (!e) {
+        e = (RasGranEnt *)calloc(1, sizeof *e);
+        if (!e)
+            return;
+        e->gran = g;
+        e->next = g_ras_by_gran[b];
+        g_ras_by_gran[b] = e;
+    }
+    if (e->n == e->cap) {
+        size_t cap = e->cap ? e->cap * 2 : 8;
+        void ***nv = (void ***)realloc(e->cells, cap * sizeof *nv);
+        if (!nv)
+            return;
+        e->cells = nv;
+        e->cap = cap;
+    }
+    e->cells[e->n++] = cell;
+}
+
+static void ras_cells_clear_range(const uint32_t *lo, const uint32_t *hi)
+{
+    if (hi <= lo)
+        return;
+    uint64_t g0 = (uintptr_t)lo >> RAS_GRAN_SHIFT;
+    uint64_t g1 = (uintptr_t)(hi - 1) >> RAS_GRAN_SHIFT;
+    for (uint64_t g = g0; g <= g1; g++) {
+        RasGranEnt **pp = &g_ras_by_gran[ras_gran_bucket(g)];
+        while (*pp) {
+            RasGranEnt *e = *pp;
+            if (e->gran != g) {
+                pp = &e->next;
+                continue;
+            }
+            size_t w = 0;
+            for (size_t i = 0; i < e->n; i++) {
+                void *v = __atomic_load_n(e->cells[i], __ATOMIC_RELAXED);
+                if ((const uint32_t *)v >= lo && (const uint32_t *)v < hi) {
+                    __atomic_store_n(e->cells[i], (void *)NULL, __ATOMIC_RELEASE);
+                    continue;
+                }
+                if (v && ((uintptr_t)v >> RAS_GRAN_SHIFT) == g)
+                    e->cells[w++] = e->cells[i];
+            }
+            e->n = w;
+            if (!e->n) {
+                *pp = e->next;
+                free(e->cells);
+                free(e);
+            }
+            break;
+        }
+    }
+}
+
+static void ras_index_clear(void)
+{
+    for (unsigned b = 0; b < RAS_GRAN_BUCKETS; b++) {
+        RasGranEnt *e = g_ras_by_gran[b];
+        while (e) {
+            RasGranEnt *nx = e->next;
+            free(e->cells);
+            free(e);
+            e = nx;
+        }
+        g_ras_by_gran[b] = NULL;
+    }
+}
+
+static void ras_index_abandon(void)
+{
+    memset(g_ras_by_gran, 0, sizeof g_ras_by_gran);
 }
 
 static uint64_t g_self_rip;
@@ -19207,7 +19322,7 @@ static void **ras_slot_alloc(void)
     return s;
 }
 
-static void pending_add_ras(uint64_t target_key, void **ras_slot)
+static void pending_add_ras_tagged(uint64_t target_key, void **ras_slot, int cell)
 {
     PendingChain *e = (PendingChain *)malloc(sizeof *e);
     if (!e)
@@ -19218,11 +19333,21 @@ static void pending_add_ras(uint64_t target_key, void **ras_slot)
     e->cond_site = NULL;
     e->ras_slot = ras_slot;
     e->src = NULL;
-    e->edge = 0;
+    e->edge = (uint8_t)cell;
     e->kind = EDGE_XBLOCK;
     e->pin_class = 0;
     e->next = g_pending[h];
     g_pending[h] = e;
+}
+
+static void pending_add_ras(uint64_t target_key, void **ras_slot)
+{
+    pending_add_ras_tagged(target_key, ras_slot, 0);
+}
+
+static void pending_add_ras_cell(uint64_t target_key, void **cell)
+{
+    pending_add_ras_tagged(target_key, cell, 1);
 }
 
 static void *body_entry_for(const JitBlock *t, uint64_t src_sig)
@@ -19242,6 +19367,8 @@ static void pending_drain(uint64_t key, JitBlock *target)
             if (e->ras_slot) {
                 chaincheck("ras_slot", ras_entry_for(target));
                 __atomic_store_n(e->ras_slot, ras_entry_for(target), __ATOMIC_RELEASE);
+                if (e->edge)
+                    ras_cell_note(e->ras_slot, ras_entry_for(target));
             }
             else if (e->kind == EDGE_BODY) {
                 int compatible = e->pin_class
@@ -20939,14 +21066,19 @@ static void tc_imm_write(uint32_t *w, uint64_t v)
         w[k] = (w[k] & ~(0xffffu << 5)) | ((uint32_t)(v >> (16 * k)) & 0xffffu) << 5;
 }
 
-static void tc_ras_fill(OcerzJit *jit, void **cell, uint64_t retaddr, int mode32)
+static void tc_ras_fill(OcerzJit *jit, void **cell, uint64_t retaddr, int mode32, int registered)
 {
     JitBlock *rb = cache_lookup(jit, retaddr, mode32);
-    if (rb && rb->code)
+    if (rb && rb->code) {
         *cell = ras_entry_for(rb);
-    else {
+        if (registered)
+            ras_cell_note(cell, *cell);
+    } else {
         *cell = NULL;
-        pending_add_ras(jit_key(retaddr, mode32), cell);
+        if (registered)
+            pending_add_ras_cell(jit_key(retaddr, mode32), cell);
+        else
+            pending_add_ras(jit_key(retaddr, mode32), cell);
     }
 }
 
@@ -20978,14 +21110,14 @@ static int tc_bind(OcerzJit *jit, JitBlock *blk, uint32_t *code, const TcReloc *
         const TcReloc *r = &rel[i];
         uint32_t *w = code + r->off;
         if (r->kind == TCR_RASCELL) {
-            ras_cell_register((void **)w);
-            tc_ras_fill(jit, (void **)w, r->arg, mode32);
+            int registered = ras_cell_register((void **)w);
+            tc_ras_fill(jit, (void **)w, r->arg, mode32, registered);
             continue;
         }
         if (!fresh)
             continue;
         if (r->kind == TCR_RASSLOT)
-            tc_ras_fill(jit, (void **)(uintptr_t)g_tc_val[i], r->arg, mode32);
+            tc_ras_fill(jit, (void **)(uintptr_t)g_tc_val[i], r->arg, mode32, 0);
         if (r->form == 1)
             *(uint64_t *)(void *)w = g_tc_val[i];
         else
@@ -23635,10 +23767,14 @@ promo_push_fallthrough:
                 tc_note((uint32_t *)cell, TCR_RASCELL, 1, g_raslit[i].retaddr);
                 continue;
             }
-            ras_cell_register(cell);
+            int registered = ras_cell_register(cell);
             JitBlock *rb = cache_lookup(g_xlat_jit, g_raslit[i].retaddr, g_xlat_mode32);
-            if (rb && rb->code)
+            if (rb && rb->code) {
                 *cell = ras_entry_for(rb);
+                if (registered)
+                    ras_cell_note(cell, *cell);
+            } else if (registered)
+                pending_add_ras_cell(jit_key(g_raslit[i].retaddr, g_xlat_mode32), cell);
             else
                 pending_add_ras(jit_key(g_raslit[i].retaddr, g_xlat_mode32), cell);
         }
@@ -24478,6 +24614,7 @@ void ocerz_jit_forget(struct OcerzVM *vm)
     pthread_mutex_init(&jit_lock, NULL);
     g_xlat_jit = NULL;
     g_n_ras_cells = 0;
+    ras_index_abandon();
     g_ras_slot_n = 0;
     memset(g_pending, 0, sizeof g_pending);
     if (vm)
@@ -24691,6 +24828,7 @@ static void invalidate_all_locked(OcerzJit *jit)
     patched |= force_stop_sites_writable(jit);
     for (size_t i = 0; i < g_n_ras_cells; i++)
         __atomic_store_n(g_ras_cells[i], (void *)NULL, __ATOMIC_RELEASE);
+    ras_index_clear();
     for (size_t k = 0; k < jit->n_live; k++) {
         JitBlock *b = jit->live[k];
         for (int i = 0; i < b->n_edges; i++) {
@@ -25535,12 +25673,8 @@ static void flip_retire_locked(struct OcerzVM *vm, OcerzJit *jit, JitBlock *blk)
     const uint32_t *lo = (const uint32_t *)blk->code, *hi = lo + blk->code_words;
 #define IN_BLK(p) ((const uint32_t *)(p) >= lo && (const uint32_t *)(p) < hi)
     size_t idx = blk->live_idx;
-    if (idx >= jit->n_live || jit->live[idx] != blk) {
-        idx = jit->n_live;
-        for (size_t k = 0; k < jit->n_live; k++)
-            if (jit->live[k] == blk) { idx = k; break; }
-    }
-    if (idx == jit->n_live) return;
+    if (idx >= jit->n_live || jit->live[idx] != blk)
+        return;
     pthread_jit_write_protect_np(0);
     if (blk->stop_patch && blk->stop_insn && *blk->stop_patch != blk->stop_insn) {
         __atomic_store_n(blk->stop_patch, blk->stop_insn, __ATOMIC_RELEASE);
@@ -25588,9 +25722,7 @@ static void flip_retire_locked(struct OcerzVM *vm, OcerzJit *jit, JitBlock *blk)
         }
     }
     blk->n_preds = 0;
-    for (size_t i = 0; i < g_n_ras_cells; i++)
-        if (IN_BLK(*g_ras_cells[i]))
-            __atomic_store_n(g_ras_cells[i], (void *)NULL, __ATOMIC_RELEASE);
+    ras_cells_clear_range(lo, hi);
     pthread_jit_write_protect_np(1);
     unsigned h = hash_key(blk->key);
     JitBlock **pp = &jit->buckets[h];
@@ -25847,6 +25979,7 @@ static void jit_arena_reset_locked(OcerzJit *jit)
     pending_clear();
     __atomic_store_n(&g_flush_want, 0, __ATOMIC_RELAXED);
     g_n_ras_cells = 0;
+    ras_index_clear();
     g_ras_slot_n = 0;
     g_n_psc_tables = 0;
     g_psc_used = 0;
