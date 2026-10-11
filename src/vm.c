@@ -1484,8 +1484,10 @@ static void async_sig_handler(int sig, siginfo_t *si, void *ctx)
             __atomic_or_fetch(&c->sig_pending, 1ull << (sig - 1), __ATOMIC_SEQ_CST);
         else
             __atomic_or_fetch(&g_pending_async_mask, 1u << sig, __ATOMIC_SEQ_CST);
-        if (c)
+        if (c) {
             __atomic_fetch_add(&c->sig_host_rcvd[sig], 1u, __ATOMIC_RELAXED);
+            guest_wait_kick();
+        }
     }
 }
 
@@ -4041,6 +4043,7 @@ void ocerz_thread_detach(void)
 static void ocerz_kick_handler(int sig, siginfo_t *si, void *uc)
 {
     (void)sig; (void)si; (void)uc;
+    guest_wait_kick();
 }
 static void ocerz_install_kick_handler(void)
 {
