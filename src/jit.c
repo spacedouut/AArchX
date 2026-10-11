@@ -514,6 +514,10 @@
  * block again).  Only the overlapping blocks are retired - dropping the whole
  * cache per flip made CEF startup a full retranslation storm.  Their code stays
  * allocated on a retired list, so a thread still inside runs to its next exit.
+ * The words a retirement puts back (stop sites, their conditional sites, the
+ * chains of its predecessors) are collected and synchronised together once
+ * write protection is back on, one barrier per retirement rather than one per
+ * word, before the JIT lock is released.
  * A 64 KB region whose translations keep being invalidated (a JS engine
  * W^X-flipping its code space) is run interpreted after a few hits, but not
  * permanently: module-load fixups also retire blocks a few times and then never
@@ -25251,6 +25255,38 @@ static void retire_unlink_hits(OcerzJit *jit, JitBlock **hits, size_t n_hits)
     }
 }
 
+static uint32_t **g_retire_sites;
+static size_t g_retire_nsites, g_retire_sites_cap;
+
+static void retire_site_note(uint32_t *site)
+{
+    if (g_retire_nsites == g_retire_sites_cap) {
+        size_t cap = g_retire_sites_cap ? g_retire_sites_cap * 2 : 64;
+        uint32_t **ns = (uint32_t **)realloc(g_retire_sites, cap * sizeof *ns);
+        if (!ns) {
+            sys_icache_invalidate(site, 4);
+            return;
+        }
+        g_retire_sites = ns;
+        g_retire_sites_cap = cap;
+    }
+    g_retire_sites[g_retire_nsites++] = site;
+}
+
+static void retire_sites_sync(void)
+{
+    size_t n = g_retire_nsites;
+    if (!n)
+        return;
+    for (size_t i = 0; i < n; i++)
+        __asm__ volatile("dc cvau, %0" :: "r"(g_retire_sites[i]) : "memory");
+    __asm__ volatile("dsb ish" ::: "memory");
+    for (size_t i = 0; i < n; i++)
+        __asm__ volatile("ic ivau, %0" :: "r"(g_retire_sites[i]) : "memory");
+    __asm__ volatile("dsb ish\n\tisb" ::: "memory");
+    g_retire_nsites = 0;
+}
+
 static unsigned g_retire_sweep;
 static int ras_entry_in_hits(const void *entry, void *arg)
 {
@@ -25320,12 +25356,12 @@ static void retire_hit_blocks_locked(struct OcerzVM *vm, OcerzJit *jit, JitBlock
         JitBlock *b = hits[m];
         if (b->stop_patch && b->stop_insn && *b->stop_patch != b->stop_insn) {
             __atomic_store_n(b->stop_patch, b->stop_insn, __ATOMIC_RELEASE);
-            sys_icache_invalidate(b->stop_patch, 4);
+            retire_site_note(b->stop_patch);
         }
         for (int i = 0; i < b->n_stop_extra; i++)
             if (*b->stop_extra[i].site != b->stop_extra[i].insn) {
                 __atomic_store_n(b->stop_extra[i].site, b->stop_extra[i].insn, __ATOMIC_RELEASE);
-                sys_icache_invalidate(b->stop_extra[i].site, 4);
+                retire_site_note(b->stop_extra[i].site);
             }
         for (int i = 0; i < b->n_edges; i++) {
             uint32_t *cs = b->edges[i].cond_site;
@@ -25334,7 +25370,7 @@ static void retire_hit_blocks_locked(struct OcerzVM *vm, OcerzJit *jit, JitBlock
                 is_stop = b->edges[i].patch_b == b->stop_extra[q].site;
             if (cs && b->edges[i].cond_orig && *cs != b->edges[i].cond_orig && is_stop) {
                 __atomic_store_n(cs, b->edges[i].cond_orig, __ATOMIC_RELEASE);
-                sys_icache_invalidate(cs, 4);
+                retire_site_note(cs);
             }
         }
     }
@@ -25344,13 +25380,13 @@ static void retire_hit_blocks_locked(struct OcerzVM *vm, OcerzJit *jit, JitBlock
         if (at && fallback && *at != fallback && \
             ptr_in_hits(hits, n_hits, chain_target(jit, at, *at))) { \
             __atomic_store_n(at, fallback, __ATOMIC_RELEASE); \
-            sys_icache_invalidate(at, 4); \
+            retire_site_note(at); \
         } \
         uint32_t *cs = (sblk)->edges[i].cond_site; \
         if (cs && (sblk)->edges[i].cond_orig && *cs != (sblk)->edges[i].cond_orig && \
             ptr_in_hits(hits, n_hits, chain_target(jit, cs, *cs))) { \
             __atomic_store_n(cs, (sblk)->edges[i].cond_orig, __ATOMIC_RELEASE); \
-            sys_icache_invalidate(cs, 4); \
+            retire_site_note(cs); \
         } \
     } while (0)
     if (full_scan) {
@@ -25374,6 +25410,7 @@ static void retire_hit_blocks_locked(struct OcerzVM *vm, OcerzJit *jit, JitBlock
     }
 #undef UNCHAIN_EDGE
     pthread_jit_write_protect_np(1);
+    retire_sites_sync();
     retire_unlink_hits(jit, hits, n_hits);
     for (unsigned i = 0; i < g_ras_slot_n; i++) {
         void *e = __atomic_load_n(&g_ras_slots[i], __ATOMIC_RELAXED);
