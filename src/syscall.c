@@ -771,7 +771,7 @@ static int private_file_backing(uint64_t gaddr, uint64_t len, int fd, uint64_t p
             void *hp = ocerz_g2h(ilo);
             if (mmap(hp, (size_t)(mhi - ilo), PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_FIXED, fd, (off_t)(pos + (ilo - lo))) == hp) {
-                if (getenv("OCERZ_MEMTRACE"))
+                if (ENV_SET("OCERZ_MEMTRACE"))
                     fprintf(stderr, "ocerz: FILEMAP-DIRECT gaddr=%#llx interior=[%#llx,%#llx) of len=%#llx\n",
                             (unsigned long long)gaddr, (unsigned long long)ilo,
                             (unsigned long long)mhi, (unsigned long long)len);
@@ -822,7 +822,7 @@ static int guest_mmap_apply(OcerzVM *vm, OcerzCPU *cpu, uint64_t addr, uint64_t 
         }
 
         gaddr = 0;
-        if (addr != 0 && !getenv("OCERZ_NO_MMAP_HINT") &&
+        if (addr != 0 && !ENV_SET("OCERZ_NO_MMAP_HINT") &&
             ocerz_map_hint(addr, len, prot) == OCERZ_OK)
             gaddr = addr & ~0x3fffull;
         if (gaddr == 0)
@@ -862,7 +862,7 @@ static int guest_mmap_apply(OcerzVM *vm, OcerzCPU *cpu, uint64_t addr, uint64_t 
         invalidate_guest_mapping(vm, gaddr, len);
     }
 
-    if (getenv("OCERZ_MEMTRACE")) {
+    if (ENV_SET("OCERZ_MEMTRACE")) {
         char path[256];
         path[0] = 0;
         fcntl(fd, F_GETPATH, path);
@@ -878,7 +878,7 @@ static int guest_mmap_apply(OcerzVM *vm, OcerzCPU *cpu, uint64_t addr, uint64_t 
                 ? ocerz_map_shared_file_padded(gaddr, len, prot, fd, pos)
                 : ocerz_map_shared_file(gaddr, len, prot, fd, pos);
         (void)readonly_shared_subpage;
-        if (getenv("OCERZ_MEMTRACE") || getenv("OCERZ_SHAREDLOG")) {
+        if (ENV_SET("OCERZ_MEMTRACE") || ENV_SET("OCERZ_SHAREDLOG")) {
             char path[256];
             path[0] = 0;
             fcntl(fd, F_GETPATH, path);
@@ -962,7 +962,7 @@ static int guest_mprotect_apply(OcerzVM *vm, OcerzCPU *cpu, uint64_t addr, uint6
         ocerz_jit_require_ordered(vm);
     invalidate_guest_mapping(vm, addr, len);
     int rc = ocerz_protect(addr, len, prot);
-    if (rc != OCERZ_OK && getenv("OCERZ_MAPFAILLOG"))
+    if (rc != OCERZ_OK && ENV_SET("OCERZ_MAPFAILLOG"))
         fprintf(stderr, "ocerz: PROTFAIL[%d] addr=%#llx len=%#llx prot=%#x rc=%d rip=%#llx\n", (int)getpid(),
                 (unsigned long long)addr, (unsigned long long)len, (unsigned)prot, rc, (unsigned long long)cpu->rip);
     if (rc == OCERZ_OK)
@@ -2669,7 +2669,7 @@ static void ocerz_release_received_ool(const mach_msg_descriptor_t *descriptor,
                                        uint8_t type, uint64_t address,
                                        uint64_t bytes, int keep_port_rights)
 {
-    if (!address || !bytes || getenv("OCERZ_KEEP_RAW_OOL"))
+    if (!address || !bytes || ENV_SET("OCERZ_KEEP_RAW_OOL"))
         return;
     if (type == MACH_MSG_OOL_PORTS_DESCRIPTOR && !keep_port_rights) {
         struct {
@@ -2695,7 +2695,7 @@ static uint64_t ocerz_bridge_mach_msg(uint64_t hbuf, uint64_t sz)
         return 0;
 
     uint64_t total = sz;
-    if (!getenv("OCERZ_NO_AUXTAIL")) {
+    if (!ENV_SET("OCERZ_NO_AUXTAIL")) {
 
         uint32_t aux[2] = { 0, 0 };
         memcpy(aux, (const void *)(uintptr_t)(hbuf + sz), sizeof aux);
@@ -3043,7 +3043,7 @@ static void vmmap_pad_save(uint64_t gmsg, uint32_t send_size)
     g_vmmap_pad.head = vmmap_pad_take(g_vmmap_pad.head_lo, g_vmmap_pad.head_n);
     g_vmmap_pad.tail = vmmap_pad_take(g_vmmap_pad.tail_lo, g_vmmap_pad.tail_n);
     g_vmmap_pad.armed = (g_vmmap_pad.head || g_vmmap_pad.tail);
-    if (g_vmmap_pad.armed && getenv("OCERZ_VMMAPLOG"))
+    if (g_vmmap_pad.armed && ENV_SET("OCERZ_VMMAPLOG"))
         fprintf(stderr, "ocerz: VMMAP-PAD save addr=%#llx size=%#llx head=%#llx+%#llx tail=%#llx+%#llx\n",
                 (unsigned long long)addr, (unsigned long long)size,
                 (unsigned long long)g_vmmap_pad.head_lo, (unsigned long long)g_vmmap_pad.head_n,
@@ -3133,7 +3133,7 @@ static int xlate_gpu_nocopy_buffer(uint64_t gmsg, uint32_t send_size, struct oce
         saved[k].orig = a0;
         ocerz_st(gmsg + saved[k].off, 8, ha);
     }
-    if (getenv("OCERZ_MIGTRACE"))
+    if (ENV_SET("OCERZ_MIGTRACE"))
         fprintf(stderr, "ocerz: GPU-NOCOPY[%d] buffer %#llx+%#llx -> host %#llx\n", (int)getpid(),
                 (unsigned long long)a0, (unsigned long long)len, (unsigned long long)ha);
     return 2;
@@ -3187,7 +3187,7 @@ static int ocerz_send_xlate_descriptors(uint64_t gmsg, uint32_t send_size,
     if (msg_id == 4802 || msg_id == 4804 || msg_id == 4806 || msg_id == 4808 || msg_id == 4809)
         xlate_task_vm_request(gmsg, send_size, msg_id);
     if (msg_id == 4811) {
-        if ((!send_size || send_size >= 0x4c) && getenv("OCERZ_VMMAPLOG"))
+        if ((!send_size || send_size >= 0x4c) && ENV_SET("OCERZ_VMMAPLOG"))
             fprintf(stderr, "ocerz: VMMAP-REQ addr=%#llx size=%#llx mask=%#llx flags=%#x\n",
                     (unsigned long long)ocerz_ld(gmsg + 0x30, 8),
                     (unsigned long long)ocerz_ld(gmsg + 0x38, 8),
@@ -3196,7 +3196,7 @@ static int ocerz_send_xlate_descriptors(uint64_t gmsg, uint32_t send_size,
         vmmap_pad_save(gmsg, send_size);
     }
     if (msg_id == 4811 && ocerz_low_base && (bits & 0x80000000u) &&
-        (!send_size || send_size >= 0x4c) && !getenv("OCERZ_NO_VMMAP_STEER")) {
+        (!send_size || send_size >= 0x4c) && !ENV_SET("OCERZ_NO_VMMAP_STEER")) {
         uint32_t flags = (uint32_t)ocerz_ld(gmsg + 0x48, 4);
         uint64_t size = ocerz_ld(gmsg + 0x38, 8);
         uint64_t mask = ocerz_ld(gmsg + 0x40, 8);
@@ -3209,7 +3209,7 @@ static int ocerz_send_xlate_descriptors(uint64_t gmsg, uint32_t send_size,
                 (uint64_t)(uintptr_t)ocerz_g2h(g) == g) {
                 ocerz_st(gmsg + 0x30, 8, g);
                 ocerz_st(gmsg + 0x48, 4, (flags & ~0x1u) | 0x4000u);
-                if (getenv("OCERZ_MIGTRACE"))
+                if (ENV_SET("OCERZ_MIGTRACE"))
                     fprintf(stderr, "ocerz: VMMAP-STEER[%d] size=%#llx mask=%#llx -> guest identity %#llx\n",
                             (int)getpid(), (unsigned long long)size, (unsigned long long)mask,
                             (unsigned long long)g);
@@ -3805,7 +3805,7 @@ static int sys_kevent_id(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
             ret_ok(cpu, r);
         return OCERZ_STEP_OK;
     }
-    if (getenv("OCERZ_KEVENT_WORKER")) {
+    if (ENV_SET("OCERZ_KEVENT_WORKER")) {
         uint64_t changelist = a[1];
         int nchanges = (int)a[2];
         if (nchanges > 0 && changelist != 0 &&
@@ -3832,7 +3832,7 @@ static int sys_kevent_qos(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
 
     uint64_t kq_flags = ocerz_ld(cpu->gpr[OCERZ_RSP] + 16, 8);
-    if (getenv("OCERZ_MGRPROBE") && (kq_flags & 0x20ull)) {
+    if (ENV_SET("OCERZ_MGRPROBE") && (kq_flags & 0x20ull)) {
 
         int nch = (int)a[2]; uint64_t cl = a[1];
         fprintf(stderr, "ocerz: KQWORKQ[%d] flags=%#llx nchg=%d nev=%lld",
@@ -4233,7 +4233,7 @@ static int sys_pthread_kill(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     uint64_t signo = a[1];
 
-    if (getenv("OCERZ_PTKILL")) {
+    if (ENV_SET("OCERZ_PTKILL")) {
         uint64_t selfport = ocerz_host_mach_trap(27, a);
         fprintf(stderr, "ocerz: PTKILL[%d] target=%#llx signo=%llu self=%#llx cross=%d handler=%#llx\n",
                 (int)getpid(), (unsigned long long)a[0], (unsigned long long)signo,
@@ -4647,7 +4647,7 @@ static int sys_sigreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         cpu->fs_base = ocerz_ld(uc + 64, 8);
         ocerz_st(uc + 72, 8, 0);
     }
-    if (getenv("OCERZ_GSTRACE"))
+    if (ENV_SET("OCERZ_GSTRACE"))
         fprintf(stderr,
                 "ocerz: GS sigreturn[%d] cpu#%u gs %#llx rip=%#llx%s\n",
                 (int)getpid(), cpu->cpu_number,

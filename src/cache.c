@@ -105,6 +105,7 @@
 #include "ocerz/tcache.h"
 
 #define CACHE_STEM "dyld_shared_cache_x86_64"
+#define ENV_SET(name) ({ static int set_ = -1; if (set_ < 0) set_ = getenv(name) != NULL; set_; })
 
 static const char *const g_cache_dirs[] = {
     "/System/Volumes/Preboot/Cryptexes/Rosetta/System/Library/dyld/",
@@ -266,7 +267,7 @@ int ocerz_cache_lazy_fault(uintptr_t addr)
                         mprotect((void *)(uintptr_t)base, (size_t)hp, g_lazy[i].final_prot);
                         installed = 1;
                     }
-                    if (getenv("OCERZ_LAZYCHECK") && kr == KERN_SUCCESS) {
+                    if (ENV_SET("OCERZ_LAZYCHECK") && kr == KERN_SUCCESS) {
                         uint8_t *chk = (uint8_t *)mmap(NULL, (size_t)hp, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
                         if (chk != MAP_FAILED && pread(g_lazy[i].fd, chk, (size_t)hp, (off_t)(g_lazy[i].foff + off)) == got) {
                             for (uint32_t k = 0; k < per; k++) {
