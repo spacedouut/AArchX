@@ -642,8 +642,29 @@ unsafe fn symtab_hash_of(
     }
 }
 
+unsafe fn symtab_hash_probe(img: *mut DynImage, hash: *mut SymtabHash, sym: *const c_char) -> u64 {
+    let mask = (*hash).mask;
+    let ent = (*hash).ent;
+    let strs = (*hash).strs;
+    let mut h = super::exports::symidx_hash(sym) as usize & mask;
+    loop {
+        let slot = ent.add(h);
+        if (*slot).strx == 0 {
+            return 0;
+        }
+        if libc::strcmp(strs.add((*slot).strx as usize), sym) == 0 {
+            return (*slot).value.wrapping_add((*img).slide as u64);
+        }
+        h = (h + 1) & mask;
+    }
+}
+
 pub(super) unsafe fn image_symtab_resolve(img: *mut DynImage, sym: *const c_char) -> u64 {
     let mh = (*img).slice;
+    let cached = AtomicPtr::from_ptr(ptr::addr_of_mut!((*img).symtab_hash)).load(Ordering::Acquire);
+    if !cached.is_null() && (*cached).slice == mh {
+        return symtab_hash_probe(img, cached, sym);
+    }
     let ncmds = rd32(mh.add(16));
     let mut lc = mh.add(core::mem::size_of::<MachHeader64>());
     let mut symoff = 0;
@@ -667,19 +688,7 @@ pub(super) unsafe fn image_symtab_resolve(img: *mut DynImage, sym: *const c_char
     let strs = mh.add(stroff as usize).cast::<c_char>();
     let hash = symtab_hash_of(img, nl, nsyms, strs, strsize);
     if !hash.is_null() {
-        let mask = (*hash).mask;
-        let ent = (*hash).ent;
-        let mut h = super::exports::symidx_hash(sym) as usize & mask;
-        loop {
-            let slot = ent.add(h);
-            if (*slot).strx == 0 {
-                return 0;
-            }
-            if libc::strcmp(strs.add((*slot).strx as usize), sym) == 0 {
-                return (*slot).value.wrapping_add((*img).slide as u64);
-            }
-            h = (h + 1) & mask;
-        }
+        return symtab_hash_probe(img, hash, sym);
     }
     for i in 0..nsyms {
         let entry = nl.add((i as u64 * 16) as usize);
