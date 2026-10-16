@@ -359,16 +359,17 @@ unsafe fn alias_reg_add(lo: u64, hi: u64, object: u32) {
     libc::pthread_mutex_unlock(ptr::addr_of_mut!(G_ALIAS_REG_LOCK));
 }
 
-unsafe fn alias_reg_find(address: u64, object: u32, any_object: bool) -> bool {
-    let mut hit = false;
+unsafe fn alias_reg_lookup(address: u64, object: u32, any_object: bool) -> Option<(u64, u64)> {
+    let mut hit = None;
     libc::pthread_mutex_lock(ptr::addr_of_mut!(G_ALIAS_REG_LOCK));
     let entries = ptr::addr_of!(G_ALIAS_REG).cast::<AliasRegion>();
     for i in 0..G_ALIAS_REG_N {
         let entry = &*entries.add(i as usize);
-        hit = address >= entry.lo
+        if address >= entry.lo
             && address < entry.hi
-            && (any_object || (object != 0 && entry.object == object));
-        if hit {
+            && (any_object || (object != 0 && entry.object == object))
+        {
+            hit = Some((entry.lo, entry.hi));
             break;
         }
     }
@@ -376,23 +377,50 @@ unsafe fn alias_reg_find(address: u64, object: u32, any_object: bool) -> bool {
     hit
 }
 
-unsafe fn alias_page_ours(page: u64) -> bool {
+unsafe fn alias_reg_find(address: u64, object: u32, any_object: bool) -> bool {
+    alias_reg_lookup(address, object, any_object).is_some()
+}
+
+#[derive(Clone, Copy, Default)]
+struct AliasOurs {
+    lo: u64,
+    hi: u64,
+    host_lo: u64,
+    host_hi: u64,
+}
+
+unsafe fn alias_page_ours(page: u64, ours: &mut AliasOurs) -> bool {
+    let host = ocerz_g2h(page) as u64;
+    if page >= ours.lo && page < ours.hi && host >= ours.host_lo && host < ours.host_hi {
+        return true;
+    }
     let mut start = 0;
     let mut end = 0;
     let mut object = 0;
     let mut protection = 0;
-    let host = ocerz_g2h(page) as u64;
-    alias_reg_find(page, 0, true)
-        && host_region_entry(host, &mut start, &mut end, &mut object, &mut protection)
-        && start <= host
-        && alias_reg_find(page, object, false)
+    if !alias_reg_find(page, 0, true)
+        || !host_region_entry(host, &mut start, &mut end, &mut object, &mut protection)
+        || start > host
+    {
+        return false;
+    }
+    let Some((lo, hi)) = alias_reg_lookup(page, object, false) else {
+        return false;
+    };
+    *ours = AliasOurs {
+        lo,
+        hi,
+        host_lo: start,
+        host_hi: end,
+    };
+    true
 }
 
-unsafe fn alias_page_taken(page: u64) -> bool {
+unsafe fn alias_page_taken(page: u64, ours: &mut AliasOurs) -> bool {
     let mut at = page;
     while at < page.wrapping_add(0x4000) {
         if crate::ffi::ocerz_addr_prot(at) > 0 {
-            return !alias_page_ours(page);
+            return !alias_page_ours(page, ours);
         }
         at = at.wrapping_add(crate::ffi::OCERZ_GUEST_PAGE_SIZE as u64);
     }
@@ -439,7 +467,8 @@ unsafe fn alias_raw_region(vm: *mut OcerzVM, pointer: u64, refresh: bool) -> c_i
         let rlo = region;
         let rhi = region.wrapping_add(size);
         let win = 0x1000_0000u64;
-        if alias_page_taken(lo) {
+        let mut ours = AliasOurs::default();
+        if alias_page_taken(lo, &mut ours) {
             if env_set!("OCERZ_MIGTRACE") {
                 libc::fprintf(
                     crate::log::stderr(),
@@ -457,13 +486,13 @@ unsafe fn alias_raw_region(vm: *mut OcerzVM, pointer: u64, refresh: bool) -> c_i
         }
         while lo > rlo
             && pointer.wrapping_sub(lo.wrapping_sub(0x4000)) <= win
-            && !alias_page_taken(lo.wrapping_sub(0x4000))
+            && !alias_page_taken(lo.wrapping_sub(0x4000), &mut ours)
         {
             lo = lo.wrapping_sub(0x4000);
         }
         while hi < rhi
             && hi.wrapping_add(0x4000).wrapping_sub(pointer) <= win
-            && !alias_page_taken(hi)
+            && !alias_page_taken(hi, &mut ours)
         {
             hi = hi.wrapping_add(0x4000);
         }
@@ -1135,7 +1164,7 @@ unsafe fn ocerz_reply_alias_iokit(vm: *mut OcerzVM, reply: u64, recv_size: u32) 
                 off += 4;
                 continue;
             }
-            if guest_protection > 0 && !alias_page_ours(guest_page) {
+            if guest_protection > 0 && !alias_page_ours(guest_page, &mut AliasOurs::default()) {
                 if env_set!("OCERZ_MIGTRACE") {
                     libc::fprintf(
                         crate::log::stderr(),
