@@ -3853,7 +3853,7 @@ static mut g_retire_sites: *mut *mut u32 = core::ptr::null_mut();
 static mut g_retire_nsites: usize = 0;
 static mut g_retire_sites_cap: usize = 0;
 
-unsafe fn retire_site_note(site: *mut u32) {
+pub unsafe fn retire_site_note(site: *mut u32) {
     unsafe {
         if g_retire_nsites == g_retire_sites_cap {
             let cap = if g_retire_sites_cap != 0 {
@@ -3878,7 +3878,7 @@ unsafe fn retire_site_note(site: *mut u32) {
     }
 }
 
-unsafe fn retire_sites_sync() {
+pub unsafe fn retire_sites_sync() {
     unsafe {
         let n = g_retire_nsites;
         if n == 0 {

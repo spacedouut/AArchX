@@ -121,6 +121,7 @@ use core::mem::MaybeUninit;
 use core::ptr;
 
 use crate::inline::*;
+use crate::ported::jit_cache::{retire_site_note, retire_sites_sync};
 mod ffi {
     pub use crate::ffi::*;
     pub use crate::inline::OCERZ_CF;
@@ -4071,7 +4072,7 @@ pub unsafe extern "C" fn flip_retire_locked(
             && *(*blk).stop_patch != (*blk).stop_insn
         {
             store_code_release((*blk).stop_patch, (*blk).stop_insn);
-            sys_icache_invalidate((*blk).stop_patch.cast(), 4);
+            retire_site_note((*blk).stop_patch);
         }
         for i in 0..(*blk).n_stop_extra as usize {
             let extra = ptr::addr_of_mut!((*blk).stop_extra)
@@ -4079,7 +4080,7 @@ pub unsafe extern "C" fn flip_retire_locked(
                 .add(i);
             if *(*extra).site != (*extra).insn {
                 store_code_release((*extra).site, (*extra).insn);
-                sys_icache_invalidate((*extra).site.cast(), 4);
+                retire_site_note((*extra).site);
             }
         }
         for i in 0..(*blk).n_edges as usize {
@@ -4098,7 +4099,7 @@ pub unsafe extern "C" fn flip_retire_locked(
                 && *cs != (*edge).cond_orig && is_stop
             {
                 store_code_release(cs, (*edge).cond_orig);
-                sys_icache_invalidate(cs.cast(), 4);
+                retire_site_note(cs);
             }
         }
         for q in 0..(*blk).n_preds {
@@ -4117,14 +4118,14 @@ pub unsafe extern "C" fn flip_retire_locked(
                 && in_block(ffi::branch_word_target(at, *at).cast())
             {
                 store_code_release(at, fallback);
-                sys_icache_invalidate(at.cast(), 4);
+                retire_site_note(at);
                 cut = 1;
             }
             if !cs.is_null() && (*edge).cond_orig != 0 && *cs != (*edge).cond_orig
                 && in_block(ffi::branch_word_target(cs, *cs).cast())
             {
                 store_code_release(cs, (*edge).cond_orig);
-                sys_icache_invalidate(cs.cast(), 4);
+                retire_site_note(cs);
                 cut = 1;
             }
             if cut != 0 {
@@ -4143,6 +4144,7 @@ pub unsafe extern "C" fn flip_retire_locked(
         (*blk).n_preds = 0;
         crate::ported::jit_cache::ras_cells_clear_range(lo, hi);
         pthread_jit_write_protect_np(1);
+        retire_sites_sync();
         let h = jit_internal::hash_key((*blk).key);
         let mut pp = ptr::addr_of_mut!((*jit).buckets)
             .cast::<*mut ffi::JitBlock>()
