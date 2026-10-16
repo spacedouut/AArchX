@@ -1225,6 +1225,48 @@ static mut g_gblk: [GblkEnt; GBLK_SLOTS as usize] = [GblkEnt {
 
 static mut g_gblk_off: c_int = -1;
 
+#[derive(Clone, Copy)]
+struct GblkOvf {
+    page: u64,
+    b: *mut JitBlock,
+}
+
+const GBLK_OVF_MAX: usize = 4096;
+
+static mut g_gblk_ovf: [GblkOvf; GBLK_OVF_MAX] = [GblkOvf {
+    page: 0,
+    b: core::ptr::null_mut(),
+}; GBLK_OVF_MAX];
+
+static mut g_gblk_ovf_n: usize = 0;
+
+unsafe fn gblk_ovf_push(page: u64, b: *mut JitBlock) {
+    unsafe {
+        if g_gblk_ovf_n == GBLK_OVF_MAX {
+            g_gblk_off = 1;
+            return;
+        }
+        *core::ptr::addr_of_mut!(g_gblk_ovf)
+            .cast::<GblkOvf>()
+            .add(g_gblk_ovf_n) = GblkOvf { page, b };
+        g_gblk_ovf_n += 1;
+    }
+}
+
+unsafe fn gblk_ovf_drop(page: u64, b: *mut JitBlock) {
+    unsafe {
+        let ovf = core::ptr::addr_of_mut!(g_gblk_ovf).cast::<GblkOvf>();
+        for j in 0..g_gblk_ovf_n {
+            let e = *ovf.add(j);
+            if e.page == page && e.b == b {
+                g_gblk_ovf_n -= 1;
+                *ovf.add(j) = *ovf.add(g_gblk_ovf_n);
+                return;
+            }
+        }
+    }
+}
+
 unsafe fn gblk_slot(page: u64, create: c_int) -> c_int {
     unsafe {
         let mut i =
@@ -1259,8 +1301,10 @@ unsafe fn gblk_note(page: u64, b: *mut JitBlock, d: c_int) {
         }
         let s = gblk_slot(page, (d > 0) as c_int);
         if s < 0 {
-            if s == -2 || d > 0 {
-                g_gblk_off = 1;
+            if d > 0 {
+                gblk_ovf_push(page, b);
+            } else {
+                gblk_ovf_drop(page, b);
             }
             return;
         }
@@ -1280,7 +1324,7 @@ unsafe fn gblk_note(page: u64, b: *mut JitBlock, d: c_int) {
                 )
                 .cast::<*mut JitBlock>();
                 if nv.is_null() {
-                    g_gblk_off = 1;
+                    gblk_ovf_push(page, b);
                     return;
                 }
                 (*entry).v = nv;
@@ -1297,6 +1341,7 @@ unsafe fn gblk_note(page: u64, b: *mut JitBlock, d: c_int) {
                 return;
             }
         }
+        gblk_ovf_drop(page, b);
     }
 }
 
@@ -1356,6 +1401,7 @@ unsafe fn gran_clear_all() {
             0,
             core::mem::size_of::<[GblkEnt; GBLK_SLOTS as usize]>(),
         );
+        g_gblk_ovf_n = 0;
         g_gblk_off = if !libc::getenv(b"OCERZ_INV_SCAN\0".as_ptr().cast()).is_null() {
             1
         } else {
@@ -4166,6 +4212,7 @@ pub unsafe extern "C" fn ocerz_jit_invalidate_range(vm: *mut OcerzVM, mut addr: 
             let n_cand = if listed { 0 } else { (*jit).n_live };
             let mut gp = g0;
             let mut gj = 0u32;
+            let mut oj = 0usize;
             let mut k = 0usize;
             loop {
                 let b;
@@ -4185,14 +4232,23 @@ pub unsafe extern "C" fn ocerz_jit_invalidate_range(vm: *mut OcerzVM, mut addr: 
                         gp = gp.wrapping_add(1);
                         gj = 0;
                     }
-                    if gp >= g1 {
-                        break;
+                    if gp < g1 {
+                        let slot = *core::ptr::addr_of!(g_gblk)
+                            .cast::<GblkEnt>()
+                            .add(gs as usize);
+                        b = *slot.v.add(gj as usize);
+                        gj = gj.wrapping_add(1);
+                    } else {
+                        let ovf = core::ptr::addr_of!(g_gblk_ovf).cast::<GblkOvf>();
+                        while oj < g_gblk_ovf_n && !(g0..g1).contains(&(*ovf.add(oj)).page) {
+                            oj += 1;
+                        }
+                        if oj >= g_gblk_ovf_n {
+                            break;
+                        }
+                        b = (*ovf.add(oj)).b;
+                        oj += 1;
                     }
-                    let slot = *core::ptr::addr_of!(g_gblk)
-                        .cast::<GblkEnt>()
-                        .add(gs as usize);
-                    b = *slot.v.add(gj as usize);
-                    gj = gj.wrapping_add(1);
                     if (*b).inv_hit != 0 {
                         continue;
                     }
