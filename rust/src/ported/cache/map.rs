@@ -50,6 +50,9 @@ static mut G_LAZY: [LazyRegion; LAZY_MAX as usize] = [LazyRegion {
 }; LAZY_MAX as usize];
 static mut G_N_LAZY: c_int = 0;
 static G_LAZY_LOCK: AtomicI32 = AtomicI32::new(0);
+static G_LAZY_INFLIGHT: AtomicI32 = AtomicI32::new(0);
+const LAZY_DONE: u8 = 1;
+const LAZY_BUSY: u8 = 2;
 
 #[thread_local]
 static mut LAST_RETRY: usize = 0;
@@ -246,6 +249,30 @@ unsafe fn rebase_slide_v2(map_addr: u64, map_size: u64, cache_base: u64, si: *co
     }
 }
 
+unsafe fn lazy_backoff(s: &mut u32) {
+    unsafe {
+        if *s < 64 {
+            libc::sched_yield();
+        } else {
+            let ts = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: if *s < 512 { 200_000 } else { 2_000_000 },
+            };
+            libc::nanosleep(&ts, ptr::null_mut());
+        }
+    }
+    *s = s.wrapping_add(1);
+}
+
+unsafe fn lazy_lock() {
+    let mut s = 0u32;
+    while G_LAZY_LOCK.swap(1, Ordering::Acquire) != 0 {
+        while G_LAZY_LOCK.load(Ordering::Relaxed) != 0 {
+            unsafe { lazy_backoff(&mut s) };
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ocerz_cache_lazy_fault(addr: usize) -> c_int {
     unsafe {
@@ -263,12 +290,30 @@ pub unsafe extern "C" fn ocerz_cache_lazy_fault(addr: usize) -> c_int {
             let off = ((addr as u64).wrapping_sub(region_addr)) & !(hp - 1);
             let hidx = (off / hp) as usize;
             let page = region_addr.wrapping_add(off) as usize;
-            while G_LAZY_LOCK.swap(1, Ordering::Acquire) != 0 {}
-            if (*(*entry).done.add(hidx)) != 0 {
-                let again = ptr::addr_of!(LAST_RETRY).read() == page;
-                ptr::addr_of_mut!(LAST_RETRY).write(page);
-                G_LAZY_LOCK.store(0, Ordering::Release);
-                return if again { 0 } else { 1 };
+            let state = AtomicU8::from_ptr((*entry).done.add(hidx));
+            let mut s = 0u32;
+            loop {
+                match state.load(Ordering::Acquire) {
+                    LAZY_DONE => {
+                        let again = ptr::addr_of!(LAST_RETRY).read() == page;
+                        ptr::addr_of_mut!(LAST_RETRY).write(page);
+                        return if again { 0 } else { 1 };
+                    }
+                    LAZY_BUSY => lazy_backoff(&mut s),
+                    _ => {
+                        lazy_lock();
+                        let won = state
+                            .compare_exchange(0, LAZY_BUSY, Ordering::Relaxed, Ordering::Relaxed)
+                            .is_ok();
+                        if won {
+                            G_LAZY_INFLIGHT.fetch_add(1, Ordering::Relaxed);
+                        }
+                        G_LAZY_LOCK.store(0, Ordering::Release);
+                        if won {
+                            break;
+                        }
+                    }
+                }
             }
             ptr::addr_of_mut!(LAST_RETRY).write(0);
             let base = region_addr.wrapping_add(off);
@@ -440,8 +485,8 @@ pub unsafe extern "C" fn ocerz_cache_lazy_fault(addr: usize) -> c_int {
                     );
                 }
             }
-            (*entry).done.add(hidx).write(1);
-            G_LAZY_LOCK.store(0, Ordering::Release);
+            state.store(LAZY_DONE, Ordering::Release);
+            G_LAZY_INFLIGHT.fetch_sub(1, Ordering::Release);
             return 1;
         }
         0
@@ -450,7 +495,13 @@ pub unsafe extern "C" fn ocerz_cache_lazy_fault(addr: usize) -> c_int {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ocerz_cache_prefork() {
-    unsafe { while G_LAZY_LOCK.swap(1, Ordering::Acquire) != 0 {} }
+    unsafe {
+        lazy_lock();
+        let mut s = 0u32;
+        while G_LAZY_INFLIGHT.load(Ordering::Acquire) != 0 {
+            lazy_backoff(&mut s);
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
