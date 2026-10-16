@@ -9,7 +9,7 @@
 
 use core::ffi::{c_int, c_uint, c_void};
 use core::ptr::null_mut;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
 use crate::ffi::*;
 unsafe extern "C" {
@@ -740,6 +740,7 @@ unsafe fn br_zone_forward(
     export_name: *const core::ffi::c_char,
     sig: *const core::ffi::c_char,
     slot: u64,
+    cache: &AtomicPtr<c_void>,
 ) -> c_int {
     unsafe {
         let zone = gpr(cpu, OCERZ_RDI);
@@ -760,12 +761,16 @@ unsafe fn br_zone_forward(
             (*cpu).rip = target;
             return OCERZ_STEP_OK as c_int;
         }
-        let f = ocerz_bridge_host_symbol(
-            OCERZ_BRIDGE_LIBSYSTEM.as_ptr() as *const core::ffi::c_char,
-            export_name.add(1),
-        );
+        let mut f = cache.load(Ordering::SeqCst);
         if f.is_null() {
-            return br_answer(vm, cpu, 0);
+            f = ocerz_bridge_host_symbol(
+                OCERZ_BRIDGE_LIBSYSTEM.as_ptr() as *const core::ffi::c_char,
+                export_name.add(1),
+            );
+            if f.is_null() {
+                return br_answer(vm, cpu, 0);
+            }
+            cache.store(f, Ordering::SeqCst);
         }
         let mut outer: OcerzBridgeFrame = core::mem::zeroed();
         ocerz_bridge_raise(
@@ -794,6 +799,7 @@ unsafe fn br_zone_forward(
 macro_rules! zf_handler {
     ($name:ident, $sym:literal, $sig:literal, $slot:expr) => {
         pub unsafe extern "C" fn $name(vm: *mut OcerzVM, cpu: *mut OcerzCPU) -> c_int {
+            static CACHE: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
             unsafe {
                 br_zone_forward(
                     vm,
@@ -801,6 +807,7 @@ macro_rules! zf_handler {
                     concat!($sym, "\0").as_ptr() as *const core::ffi::c_char,
                     concat!($sig, "\0").as_ptr() as *const core::ffi::c_char,
                     $slot,
+                    &CACHE,
                 )
             }
         }
@@ -926,6 +933,7 @@ pub unsafe extern "C" fn br_malloc_zone_statistics(vm: *mut OcerzVM, cpu: *mut O
 }
 
 pub unsafe extern "C" fn br_malloc_destroy_zone(vm: *mut OcerzVM, cpu: *mut OcerzCPU) -> c_int {
+    static CACHE: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
     unsafe {
         br_zone_remove(gpr(cpu, OCERZ_RDI));
         br_zone_forward(
@@ -934,6 +942,7 @@ pub unsafe extern "C" fn br_malloc_destroy_zone(vm: *mut OcerzVM, cpu: *mut Ocer
             c"_malloc_destroy_zone".as_ptr(),
             c"v(p)".as_ptr(),
             BR_ZONE_DESTROY,
+            &CACHE,
         )
     }
 }
