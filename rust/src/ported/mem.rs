@@ -3475,19 +3475,33 @@ pub unsafe extern "C" fn ocerz_mem_disarm_range(
     }
 }
 
+static mut DISARM_CUR_RI: c_int = 0;
+static mut DISARM_CUR_PI: usize = 0;
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ocerz_mem_disarm_all(pages: *mut u64, max: c_int) -> c_int {
     unsafe {
+        if G_ARMED_LIVE.load(Ordering::Relaxed) <= 0 {
+            return 0;
+        }
         let mut n: c_int = 0;
         map_lock_acquire();
         let rn = REGION_N.load(Ordering::Relaxed);
-        let mut ri = 0;
-        while ri < rn && n < max {
+        if DISARM_CUR_RI >= rn {
+            DISARM_CUR_RI = 0;
+            DISARM_CUR_PI = 0;
+        }
+        let (sri, spi) = (DISARM_CUR_RI, DISARM_CUR_PI);
+        let steps = rn + (spi != 0) as c_int;
+        let mut k = 0;
+        while k < steps && n < max {
+            let ri = (sri + k) % rn;
             let r = ((&raw mut REGIONS) as *mut MemRegion).add(ri as usize);
             if !(*r).armed.is_null() {
                 let np = (((*r).ghi - (*r).glo) / OCERZ_HOST_PAGE) as usize;
-                let mut i = 0;
-                while i < np && n < max {
+                let mut i = if k == 0 { spi } else { 0 };
+                let hi = if k == rn { spi.min(np) } else { np };
+                while i < hi && n < max {
                     if *(*r).armed.add(i) != 0 {
                         *(*r).armed.add(i) = 0;
                         G_ARMED_LIVE.fetch_sub(1, Ordering::Relaxed);
@@ -3503,11 +3517,13 @@ pub unsafe extern "C" fn ocerz_mem_disarm_all(pages: *mut u64, max: c_int) -> c_
                         }
                         *pages.add(n as usize) = page;
                         n += 1;
+                        DISARM_CUR_RI = ri;
+                        DISARM_CUR_PI = i + 1;
                     }
                     i += 1;
                 }
             }
-            ri += 1;
+            k += 1;
         }
         map_lock_release();
         n

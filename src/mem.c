@@ -2234,13 +2234,21 @@ int ocerz_mem_disarm_range(uint64_t lo, uint64_t hi, uint64_t *pages, int max)
 
 int ocerz_mem_disarm_all(uint64_t *pages, int max)
 {
+    static int cur_ri;
+    static size_t cur_pi;
+    if (__atomic_load_n(&g_armed_live, __ATOMIC_RELAXED) <= 0) return 0;
     int n = 0;
     map_lock_acquire();
-    for (int ri = 0; ri < region_n && n < max; ri++) {
+    if (cur_ri >= region_n) cur_ri = 0, cur_pi = 0;
+    int sri = cur_ri, steps = region_n + (cur_pi != 0);
+    size_t spi = cur_pi;
+    for (int k = 0; k < steps && n < max; k++) {
+        int ri = (sri + k) % region_n;
         MemRegion *r = &regions[ri];
         if (!r->armed) continue;
         size_t np = (size_t)((r->ghi - r->glo) / OCERZ_HOST_PAGE);
-        for (size_t i = 0; i < np && n < max; i++) {
+        size_t hi = k == region_n ? (spi < np ? spi : np) : np;
+        for (size_t i = k == 0 ? spi : 0; i < hi && n < max; i++) {
             if (!r->armed[i]) continue;
             r->armed[i] = 0;
             __atomic_sub_fetch(&g_armed_live, 1, __ATOMIC_RELAXED);
@@ -2250,6 +2258,7 @@ int ocerz_mem_disarm_all(uint64_t *pages, int max)
             if (has_data)
                 mprotect(ocerz_g2h(page), (size_t)OCERZ_HOST_PAGE, host_prot(gp));
             pages[n++] = page;
+            cur_ri = ri, cur_pi = i + 1;
         }
     }
     map_lock_release();
