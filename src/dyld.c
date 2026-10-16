@@ -756,22 +756,64 @@ static uint64_t g_run_init_args[5];
 static int g_run_init_ready;
 static uint64_t g_dlerror_g;
 
+/*
+ * g_dimgs by name, so that each import's bind finds its library without a scan
+ * of every image.  A key is the first image in g_dimgs to have it as its path
+ * (g_dimg_by_path) or as its install, id or rpath name (g_dimg_by_name), the
+ * one a scan in load order would find.  Images are only appended, so each is
+ * added once its names are set (dimg_index); a rollback, or a name set later,
+ * rebuilds both (dimg_reindex).
+ */
+#define DIMG_IDX_BITS 13   /* 3 names for each of DYN_DIMG_MAX images */
+#define DIMG_IDX_MASK ((1u << DIMG_IDX_BITS) - 1)
+typedef struct { const char *key; DynImage *d; } DimgSlot;
+static DimgSlot g_dimg_by_path[1u << DIMG_IDX_BITS], g_dimg_by_name[1u << DIMG_IDX_BITS];
+
+static uint32_t depmap_hash(const char *s);
+
+static DimgSlot *dimg_slot(DimgSlot *t, const char *key)
+{
+    uint32_t h = depmap_hash(key) & DIMG_IDX_MASK;
+    while (t[h].key && strcmp(t[h].key, key) != 0)
+        h = (h + 1) & DIMG_IDX_MASK;
+    return &t[h];
+}
+
+static void dimg_index_key(DimgSlot *t, const char *key, DynImage *d)
+{
+    DimgSlot *s;
+    if (key[0] && !(s = dimg_slot(t, key))->key) {
+        s->d = d;
+        s->key = key;
+    }
+}
+
+static void dimg_index(DynImage *d)
+{
+    dimg_index_key(g_dimg_by_path, d->path, d);
+    dimg_index_key(g_dimg_by_name, d->install_name, d);
+    dimg_index_key(g_dimg_by_name, d->id_name, d);
+    dimg_index_key(g_dimg_by_name, d->rpath_name, d);
+}
+
+static void dimg_reindex(void)
+{
+    memset(g_dimg_by_path, 0, sizeof g_dimg_by_path);
+    memset(g_dimg_by_name, 0, sizeof g_dimg_by_name);
+    for (int i = 0; i < g_dimgs_n; i++)
+        dimg_index(&g_dimgs[i]);
+}
+
 static DynImage *dimg_find_by_path(const char *path)
 {
-    for (int i = 0; i < g_dimgs_n; i++)
-        if (g_dimgs[i].path[0] && strcmp(g_dimgs[i].path, path) == 0)
-            return &g_dimgs[i];
-    return NULL;
+    DimgSlot *s = dimg_slot(g_dimg_by_path, path);
+    return s->key ? s->d : NULL;
 }
 
 static DynImage *dimg_find_by_install_name(const char *iname)
 {
-    for (int i = 0; i < g_dimgs_n; i++)
-        if ((g_dimgs[i].install_name[0] && strcmp(g_dimgs[i].install_name, iname) == 0) ||
-            (g_dimgs[i].id_name[0] && strcmp(g_dimgs[i].id_name, iname) == 0) ||
-            (g_dimgs[i].rpath_name[0] && strcmp(g_dimgs[i].rpath_name, iname) == 0))
-            return &g_dimgs[i];
-    return NULL;
+    DimgSlot *s = dimg_slot(g_dimg_by_name, iname);
+    return s->key ? s->d : NULL;
 }
 
 static void dimg_record_id(DynImage *d)
@@ -1396,24 +1438,42 @@ unsigned ocerz_dyld_generation(void)
     return (unsigned)g_dimgs_n;
 }
 
+/* The dylib load commands' names of the image being bound, by ordinal, read
+   once for all of its imports.  apply_fixups and apply_classic_fixups drop it,
+   so an image that comes to occupy a freed one's DynImage reads its own. */
+static const DynImage *g_ord_img;
+static const char **g_ord_name;
+static int g_ord_n, g_ord_cap;
+
 static const char *dimg_ordinal_name(DynImage *img, int ord)
 {
     if (ord <= 0)
         return NULL;
-    const uint8_t *mh = img->slice;
-    uint32_t ncmds = rd32(mh + 16);
-    const uint8_t *lc = mh + sizeof(struct mach_header_64);
-    int n = 0;
-    for (uint32_t i = 0; i < ncmds; i++) {
-        uint32_t cmd = rd32(lc);
-        if (cmd == LC_LOAD_DYLIB || cmd == LC_LOAD_WEAK_DYLIB ||
-            cmd == LC_REEXPORT_DYLIB || cmd == LC_LOAD_UPWARD_DYLIB) {
-            if (++n == ord)
-                return (const char *)(lc + rd32(lc + 8));
+    if (g_ord_img != img) {
+        const uint8_t *mh = img->slice;
+        uint32_t ncmds = rd32(mh + 16);
+        const uint8_t *lc = mh + sizeof(struct mach_header_64);
+        g_ord_img = NULL;
+        g_ord_n = 0;
+        for (uint32_t i = 0; i < ncmds; i++) {
+            uint32_t cmd = rd32(lc);
+            if (cmd == LC_LOAD_DYLIB || cmd == LC_LOAD_WEAK_DYLIB ||
+                cmd == LC_REEXPORT_DYLIB || cmd == LC_LOAD_UPWARD_DYLIB) {
+                if (g_ord_n == g_ord_cap) {
+                    int cap = g_ord_cap ? g_ord_cap * 2 : 64;
+                    const char **grown = realloc(g_ord_name, (size_t)cap * sizeof *grown);
+                    if (!grown)
+                        return NULL;
+                    g_ord_name = grown;
+                    g_ord_cap = cap;
+                }
+                g_ord_name[g_ord_n++] = (const char *)(lc + rd32(lc + 8));
+            }
+            lc += rd32(lc + 4);
         }
-        lc += rd32(lc + 4);
+        g_ord_img = img;
     }
-    return NULL;
+    return ord <= g_ord_n ? g_ord_name[ord - 1] : NULL;
 }
 
 static uint64_t disk_flat_resolve_ex(const char *name, int *found)
@@ -1946,6 +2006,7 @@ static void protect_ro_drop(const DynImage *img)
 
 static int apply_fixups(DynImage *img, OcerzCache *cache)
 {
+    g_ord_img = NULL;
     if (img->cf_off == 0)
         return OCERZ_OK;
     const uint8_t *cf = img->slice + img->cf_off;
@@ -2444,6 +2505,7 @@ static int weak_stream_enabled(void)
 
 static int apply_classic_fixups(DynImage *img, OcerzCache *cache)
 {
+    g_ord_img = NULL;
     if (!img->has_dyld_info)
         return apply_legacy_relocations(img, cache);
     classic_rebase(img);
@@ -3996,10 +4058,12 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
         snprintf(v->path, sizeof v->path, "%s", install_name);
         snprintf(v->install_name, sizeof v->install_name, "%s", install_name);
         dimg_record_id(v);
+        dimg_index(v);
         if (map_segments(v, 0) != OCERZ_OK) {
             OCERZ_FATAL("cannot map segments of virtual %s\n", install_name);
             native_dl_reason("its synthesized image could not be mapped", NULL);
             g_dimgs_n--;
+            dimg_reindex();
             free(vbuf);
             return NULL;
         }
@@ -4022,8 +4086,10 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
     }
     if (ocerz_mode == OCERZ_MODE_NATIVE && install_name[0] == '@' && access(resolved, F_OK) != 0) {
         DynImage *d = load_disk_dylib(cache, resolved, loader, rpaths);
-        if (d && !d->rpath_name[0])
+        if (d && !d->rpath_name[0]) {
             snprintf(d->rpath_name, sizeof d->rpath_name, "%s", install_name);
+            dimg_reindex();
+        }
         return d;
     }
     if (dep_find(cache, resolved) != 0)
@@ -4086,11 +4152,13 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
     d->file_dev = fdev;
     d->file_ino = fino;
     dimg_record_id(d);
+    dimg_index(d);
 
     if (map_segments(d, 0) != OCERZ_OK) {
         OCERZ_FATAL("cannot map segments of %s\n", resolved);
         native_dl_reason("its segments could not be mapped", NULL);
         g_dimgs_n--;
+        dimg_reindex();
         free(buf);
         return NULL;
     }
@@ -4221,9 +4289,11 @@ static DynImage *dlopen_load_image(OcerzCache *cache, const char *install_path, 
     snprintf(d->install_name, sizeof d->install_name, "%s", install_path);
     file_identity(install_path, &d->file_dev, &d->file_ino);
     dimg_record_id(d);
+    dimg_index(d);
     if (map_segments(d, 0) != OCERZ_OK) {
         dlerror_set("dlopen(%s): cannot map segments", install_path);
         g_dimgs_n--;
+        dimg_reindex();
         free(buf);
         return NULL;
     }
@@ -5691,11 +5761,13 @@ static DynImage *ndl_load_file(NdlTarget *t, const RpathList *chain)
     snprintf(d->install_name, sizeof d->install_name, "%s", t->path);
     file_identity(t->path, &d->file_dev, &d->file_ino);
     dimg_record_id(d);
+    dimg_index(d);
     if (map_segments(d, 0) != OCERZ_OK) {
         native_dl_reason("its segments could not be mapped", NULL);
         g_dimgs_n--;
         free(d->owned_buf);
         memset(d, 0, sizeof *d);
+        dimg_reindex();
         return NULL;
     }
     RpathList *rp = calloc(1, sizeof *rp);
@@ -5731,6 +5803,7 @@ static void ndl_rollback(int before)
         memset(d, 0, sizeof *d);
     }
     g_dimgs_n = before;
+    dimg_reindex();
 }
 
 static uint64_t *g_ndl_add_funcs;
