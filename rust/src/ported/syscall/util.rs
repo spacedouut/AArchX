@@ -179,6 +179,45 @@ pub(super) unsafe fn ocerz_st(gaddr: u64, size: i32, value: u64) {
 }
 
 #[inline(always)]
+unsafe fn ocerz_guest_spans(gaddr: u64, len: usize, mut f: impl FnMut(*mut u8, usize, usize)) {
+    unsafe {
+        let mut done = 0usize;
+        while done < len {
+            let at = gaddr.wrapping_add(done as u64);
+            let n = (0x4000 - (at & 0x3fff) as usize).min(len - done);
+            f(ocerz_g2h(at).cast::<u8>(), done, n);
+            done += n;
+        }
+    }
+}
+
+#[inline]
+pub(super) unsafe fn ocerz_copy_from_guest(dst: *mut u8, gaddr: u64, len: usize) {
+    unsafe {
+        ocerz_guest_spans(gaddr, len, |p, off, n| {
+            core::ptr::copy_nonoverlapping(p, dst.add(off), n)
+        });
+        core::sync::atomic::fence(Ordering::Acquire);
+    }
+}
+
+#[inline]
+pub(super) unsafe fn ocerz_copy_to_guest(gaddr: u64, src: *const u8, len: usize) {
+    unsafe {
+        if crate::ffi::ocerz_watch_addr != 0 || crate::ffi::ocerz_watch_val != 0 {
+            for k in 0..len {
+                ocerz_st(gaddr.wrapping_add(k as u64), 1, *src.add(k) as u64);
+            }
+            return;
+        }
+        core::sync::atomic::fence(Ordering::Release);
+        ocerz_guest_spans(gaddr, len, |p, off, n| {
+            core::ptr::copy_nonoverlapping(src.add(off), p, n)
+        });
+    }
+}
+
+#[inline(always)]
 pub(super) unsafe fn ocerz_ld128(gaddr: u64) -> Ocerz128 {
     unsafe {
         let p = ocerz_g2h(gaddr).cast::<u8>();

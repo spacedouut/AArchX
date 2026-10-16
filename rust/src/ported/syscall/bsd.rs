@@ -222,6 +222,19 @@ unsafe fn forward_with_scratch(
     if err != 0 { r as c_int } else { 0 }
 }
 
+unsafe fn iov_from_guest(scratch: &mut [ocerz_iovec; OCERZ_IOV_MAX], giov: u64, cnt: usize) {
+    ocerz_copy_from_guest(
+        scratch.as_mut_ptr().cast(),
+        giov,
+        cnt * mem::size_of::<ocerz_iovec>(),
+    );
+    for entry in &mut scratch[..cnt] {
+        if entry.iov_base != 0 {
+            entry.iov_base = ocerz_g2h(entry.iov_base) as u64;
+        }
+    }
+}
+
 unsafe fn sys_iov(_vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: *mut [u64; 8], num: c_int) -> c_int {
     let args = &*a;
     let mut cnt = args[2];
@@ -232,13 +245,7 @@ unsafe fn sys_iov(_vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: *mut [u64; 8], num: 
         iov_base: 0,
         iov_len: 0,
     }; OCERZ_IOV_MAX];
-    for i in 0..cnt {
-        let addr = args[1].wrapping_add(i.wrapping_mul(16));
-        let base = ocerz_ld(addr, 8);
-        let entry = scratch.as_mut_ptr().add(i as usize);
-        (*entry).iov_base = if base != 0 { ocerz_g2h(base) as u64 } else { 0 };
-        (*entry).iov_len = ocerz_ld(addr.wrapping_add(8), 8);
-    }
+    iov_from_guest(&mut scratch, args[1], cnt as usize);
     let mut fa = [args[0], scratch.as_mut_ptr() as u64, args[2], 0, 0, 0, 0, 0];
     forward_with_scratch(cpu, num, &mut fa, 0);
     crate::ffi::OCERZ_STEP_OK as c_int
@@ -1470,13 +1477,7 @@ unsafe fn sys_preadv_pwritev(
         iov_base: 0,
         iov_len: 0,
     }; OCERZ_IOV_MAX];
-    for i in 0..cnt {
-        let addr = args[1].wrapping_add(i.wrapping_mul(16));
-        let base = ocerz_ld(addr, 8);
-        let entry = scratch.as_mut_ptr().add(i as usize);
-        (*entry).iov_base = if base != 0 { ocerz_g2h(base) as u64 } else { 0 };
-        (*entry).iov_len = ocerz_ld(addr.wrapping_add(8), 8);
-    }
+    iov_from_guest(&mut scratch, args[1], cnt as usize);
     let mut fa = [
         args[0],
         scratch.as_mut_ptr() as u64,

@@ -262,13 +262,7 @@ unsafe fn ocerz_sysctl_ovr_emit(
                 return crate::ffi::OCERZ_STEP_OK as c_int;
             }
             if o.is_str != 0 {
-                for k in 0..need {
-                    ocerz_st(
-                        oldp.wrapping_add(k),
-                        1,
-                        *o.sval.add(k as usize) as u8 as u64,
-                    );
-                }
+                ocerz_copy_to_guest(oldp, o.sval.cast(), need as usize);
             } else {
                 ocerz_st(oldp, need as c_int, o.ival as u64);
             }
@@ -317,13 +311,7 @@ unsafe fn x86_sysctl_emit(cpu: *mut OcerzCPU, idx: c_int, oldp: u64, oldlenp: u6
                 return crate::ffi::OCERZ_STEP_OK as c_int;
             }
             if !string.is_null() {
-                for k in 0..need {
-                    ocerz_st(
-                        oldp.wrapping_add(k),
-                        1,
-                        *string.add(k as usize) as u8 as u64,
-                    );
-                }
+                ocerz_copy_to_guest(oldp, string.cast(), need as usize);
             } else {
                 ocerz_st(oldp, need as c_int, entry.val);
             }
@@ -354,10 +342,7 @@ pub(super) unsafe fn sys_sysctl(_vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: *mut [
             && ocerz_ld(a[0].wrapping_add(4), 4) == 3
         {
             let mut name = [0 as c_char; 160];
-            for i in 0..a[5] {
-                *name.as_mut_ptr().add(i as usize) =
-                    ocerz_ld(a[4].wrapping_add(i), 1) as u8 as c_char;
-            }
+            ocerz_copy_from_guest(name.as_mut_ptr().cast(), a[4], a[5] as usize);
             *name.as_mut_ptr().add(a[5] as usize) = 0;
             let idx = x86_sysctl_find(name.as_ptr());
             if idx >= 0 {
@@ -381,10 +366,11 @@ pub(super) unsafe fn sys_sysctl(_vm: *mut OcerzVM, cpu: *mut OcerzCPU, a: *mut [
         }
         if a[4] == 0 && (2..=8).contains(&nlen) {
             let mut mib = [0 as c_int; 8];
-            for i in 0..nlen as usize {
-                *mib.as_mut_ptr().add(i) =
-                    ocerz_ld(a[0].wrapping_add(i as u64 * 4), 4) as u32 as i32;
-            }
+            ocerz_copy_from_guest(
+                mib.as_mut_ptr().cast(),
+                a[0],
+                nlen as usize * core::mem::size_of::<c_int>(),
+            );
             ocerz_sysctl_ovr_resolve();
             if log != 0 {
                 libc::fprintf(
@@ -565,10 +551,7 @@ pub(super) unsafe fn sys_sysctlbyname(
         let a = &*a;
         let mut name = [0 as c_char; 160];
         let nl = a[1].min(159);
-        for i in 0..nl {
-            *name.as_mut_ptr().add(i as usize) =
-                ocerz_ld(a[0].wrapping_add(i), 1) as u8 as c_char;
-        }
+        ocerz_copy_from_guest(name.as_mut_ptr().cast(), a[0], nl as usize);
         *name.as_mut_ptr().add(nl as usize) = 0;
         static LOG: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(-1);
         let mut log = LOG.load(core::sync::atomic::Ordering::Relaxed);
