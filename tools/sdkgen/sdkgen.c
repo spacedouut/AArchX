@@ -2220,35 +2220,63 @@ static void apply_override(Rec *r, Override *o)
     }
 }
 
-static void overrides_for(Rec *r)
+static Map g_ovr_exact, g_ovr_dup, g_ovr_stub;
+static int *g_ovr_glob;
+static int g_novr_glob;
+
+static void index_overrides(void)
 {
-    Override *exact = NULL, *variant = NULL, *glob = NULL;
-    size_t nlen = strlen(r->name);
+    g_ovr_glob = xalloc(NULL, (size_t)(g_novr + 1) * sizeof *g_ovr_glob);
     for (int i = 0; i < g_novr; i++) {
-        Override *o = &g_ovr[i];
+        const Override *o = &g_ovr[i];
         const char *k = o->kind;
         if (strcmp(k, "shape") == 0 || strcmp(k, "struct") == 0 || strcmp(k, "inplace") == 0 ||
             strcmp(k, "opaque") == 0)
             continue;
-        const char *pat = o->f[1];
         if (o->glob) {
-            if (!glob && (strcmp(k, "var") == 0 ? !r->functionish : r->functionish) &&
-                fnmatch(pat, r->name, 0) == 0)
-                glob = o;
+            g_ovr_glob[g_novr_glob++] = i;
             continue;
         }
-        if (strcmp(pat, r->name) == 0) {
-            if (exact)
-                die("overrides:%d and overrides:%d both name %s", exact->line, o->line, r->name);
-            exact = o;
-            continue;
-        }
-        size_t plen = strlen(pat);
-        if (strcmp(k, "stub") == 0 && plen < nlen && strncmp(pat, r->name, plen) == 0 &&
-            r->name[plen] == '$')
-            variant = variant ? variant : o;
+        const char *pat = o->f[1];
+        if (map_get(&g_ovr_exact, pat) < 0)
+            map_set(&g_ovr_exact, pat, i);
+        else if (map_get(&g_ovr_dup, pat) < 0)
+            map_set(&g_ovr_dup, pat, i);
+        if (strcmp(k, "stub") == 0 && map_get(&g_ovr_stub, pat) < 0)
+            map_set(&g_ovr_stub, pat, i);
     }
-    Override *o = exact ? exact : variant ? variant : glob;
+}
+
+static void overrides_for(Rec *r)
+{
+    Override *o = NULL;
+    int i = map_get(&g_ovr_exact, r->name);
+    if (i >= 0) {
+        int d = map_get(&g_ovr_dup, r->name);
+        if (d >= 0)
+            die("overrides:%d and overrides:%d both name %s", g_ovr[i].line, g_ovr[d].line, r->name);
+        o = &g_ovr[i];
+    }
+    if (!o && strchr(r->name, '$')) {
+        char *pre = xstrdup(r->name);
+        int best = -1;
+        for (char *d = strchr(pre, '$'); d; d = strchr(d + 1, '$')) {
+            *d = '\0';
+            int v = map_get(&g_ovr_stub, pre);
+            if (v >= 0 && (best < 0 || v < best))
+                best = v;
+            *d = '$';
+        }
+        free(pre);
+        if (best >= 0)
+            o = &g_ovr[best];
+    }
+    for (int j = 0; !o && j < g_novr_glob; j++) {
+        Override *g = &g_ovr[g_ovr_glob[j]];
+        if ((strcmp(g->kind, "var") == 0 ? !r->functionish : r->functionish) &&
+            fnmatch(g->f[1], r->name, 0) == 0)
+            o = g;
+    }
     if (o)
         apply_override(r, o);
 }
@@ -2372,17 +2400,19 @@ int main(int argc, char **argv)
         recs[i].objc = map_get(&ex.objc_kind, ex.v[i]) > 0 ? map_get(&ex.objc_kind, ex.v[i]) : OBJC_NONE;
         classify(&recs[i]);
     }
-    for (int i = 0; i < ex.n; i++)
+    index_overrides();
+    for (int i = 0; i < ex.n; i++) {
         overrides_for(&recs[i]);
+        map_set(&ex.names, ex.v[i], i);
+    }
     for (int i = 0; i < g_novr; i++) {
         Override *o = &g_ovr[i];
         if (strcmp(o->kind, "struct") == 0 || strcmp(o->kind, "inplace") == 0) {
             int idx = map_get(&ex.names, o->f[1]);
             if (idx < 0)
                 die("overrides:%d: %s does not export %s", o->line, g_lib.install, o->f[1]);
-            for (int j = 0; j < ex.n; j++)
-                if (strcmp(recs[j].name, o->f[1]) == 0 && recs[j].kind != R_FN)
-                    die("overrides:%d: %s record for %s, which is not fn", o->line, o->kind, o->f[1]);
+            if (recs[idx].kind != R_FN)
+                die("overrides:%d: %s record for %s, which is not fn", o->line, o->kind, o->f[1]);
             o->used = 1;
         }
         if (!o->used && o->scope && strcmp(o->kind, "opaque") == 0)
