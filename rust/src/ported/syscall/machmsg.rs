@@ -594,14 +594,19 @@ unsafe fn vmmap_pad_take(lo: u64, n: u64) -> *mut u8 {
         if b.is_null() {
             return ptr::null_mut();
         }
-        for i in 0..n {
-            if crate::ffi::ocerz_addr_readable(lo.wrapping_add(i)) == 0
-                && crate::ffi::ocerz_cache_region(lo.wrapping_add(i) as usize) == 0
+        let gp = crate::ffi::OCERZ_GUEST_PAGE_SIZE as u64;
+        let mut i = 0;
+        while i < n {
+            let a = lo.wrapping_add(i);
+            let len = (gp - (a & (gp - 1))).min(n - i);
+            if crate::ffi::ocerz_addr_readable(a) == 0
+                && crate::ffi::ocerz_cache_region(a.wrapping_add(len - 1) as usize) == 0
             {
                 libc::free(b.cast());
                 return ptr::null_mut();
             }
-            *b.add(i as usize) = ocerz_ld(lo.wrapping_add(i), 1) as u8;
+            ptr::copy_nonoverlapping(ocerz_g2h(a).cast::<u8>(), b.add(i as usize), len as usize);
+            i += len;
         }
         b
     }
