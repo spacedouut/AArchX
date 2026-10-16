@@ -3230,6 +3230,8 @@ pub unsafe extern "C" fn ocerz_map_claim_region(gaddr: u64, len: u64, prot: c_in
     }
 }
 
+const PROTECT_OWNER_BUF: usize = 256;
+
 unsafe fn protect_part(lo: u64, hi: u64, prot: c_int) -> c_int {
     unsafe { ocerz_protect(lo, hi - lo, prot) }
 }
@@ -3252,27 +3254,43 @@ pub unsafe extern "C" fn ocerz_protect(gaddr: u64, len: u64, prot: c_int) -> c_i
         } else {
             ffi::OCERZ_OK
         };
+        let mut owners = [const { core::mem::MaybeUninit::<u32>::uninit() }; PROTECT_OWNER_BUF];
+        let mut shared_page = u64::MAX;
+        let mut shared: u8 = 0;
+        let mut k = 0usize;
         let mut p = lo;
         while rc == ffi::OCERZ_OK && p < hi {
             let state = slot_load(r, slot_index(r, p));
             if !slot_is_data(state) {
                 rc = ffi::OCERZ_ENOMEM;
             }
-            let shared = shared_load(r, pg_index(r, p));
-            if (shared & MEM_SHARED_PHYSICAL) != 0
-                && (shared & shared_slot_bit(p)) == 0
-                && prot != PROT_NONE
-            {
-                rc = ffi::OCERZ_EUNSUP;
+            if prot != PROT_NONE {
+                if round_down(p) != shared_page {
+                    shared_page = round_down(p);
+                    shared = shared_load(r, pg_index(r, p));
+                }
+                if (shared & MEM_SHARED_PHYSICAL) != 0 && (shared & shared_slot_bit(p)) == 0 {
+                    rc = ffi::OCERZ_EUNSUP;
+                }
             }
+            if k < PROTECT_OWNER_BUF {
+                owners[k].write(slot_owner(state));
+            }
+            k += 1;
             p += OCERZ_GUEST_PAGE;
         }
         if rc == ffi::OCERZ_OK {
+            let mut k = 0usize;
             let mut p = lo;
             while p < hi {
                 let i = slot_index(r, p);
-                let state = slot_load(r, i);
-                slot_store(r, i, slot_data_state(slot_owner(state), prot));
+                let owner = if k < PROTECT_OWNER_BUF {
+                    owners[k].assume_init()
+                } else {
+                    slot_owner(slot_load(r, i))
+                };
+                slot_store(r, i, slot_data_state(owner, prot));
+                k += 1;
                 p += OCERZ_GUEST_PAGE;
             }
             rc = sync_host_range_locked(r, lo, hi);
