@@ -105,6 +105,17 @@
  * _Block_copy copies one, guest-side, since the native method would run its
  * x86 copy helper.
  *
+ * ---- the descriptor cache ----
+ * A described (class, selector) pair is kept, one node per pair, and is good
+ * for the generation it was described in; registering or realizing a class
+ * and replacing an implementation start a new generation.  A send that finds
+ * its pair from an older generation looks the method up again, and when the
+ * method's type encoding still reads the same it refreshes the node's
+ * generation instead of describing it again, since the description depends on
+ * nothing but the encoding and the selector.  A pair whose encoding did change
+ * gets a new node in the old one's place; the old node stays allocated, as
+ * another thread may still be sending through it.
+ *
  * ---- results the two ABIs return differently ----
  * System V returns a structure of more than sixteen bytes in memory the caller
  * provides, and an x86 compiler therefore sends such a message with
@@ -329,6 +340,12 @@
  * delivered, which every crossing does last.  A refusal is a line on stderr and
  * OCERZ_BRIDGE_UNIMPL_EXIT, never a call made under a guessed signature.
  * OCERZ_OBJCLOG prints each send's class, selector and notation as it crosses.
+ *
+ * A native IMP handed to the guest is a guest thunk: a page of 16-byte stubs,
+ * each carrying its number in r10 and jumping into the native-IMP trampoline.
+ * A thunk's number is its place in the bound-IMP table, found again through an
+ * open-addressed index of twice the table's size, so asking for a bound IMP
+ * costs a hash probe rather than a walk over every IMP bound before it.
  */
 #include "ocerz/objcbridge.h"
 #include "ocerz/abi.h"
@@ -1266,7 +1283,7 @@ typedef struct ObShape {
 } ObShape;
 
 typedef struct ObSend {
-    struct ObSend *next;
+    struct ObSend *_Atomic next;
     void *cls;
     void *sel;
     const ObShape *shape;
@@ -1274,7 +1291,8 @@ typedef struct ObSend {
     uint32_t blocks;
     uint32_t fnptrs;
     uint32_t objects;
-    uint64_t generation;
+    const char *enc;
+    _Atomic uint64_t generation;
 } ObSend;
 
 static ObShape *_Atomic g_ob_shapes[OB_SHAPE_BUCKETS];
@@ -1329,37 +1347,63 @@ static const ObShape *ob_shape(const char *notation)
     return found;
 }
 
-static const ObSend *ob_cached(void *cls, void *sel)
+static ObSend *ob_entry(void *cls, void *sel)
 {
-    uint64_t generation = atomic_load(&g_ob_generation);
-    for (const ObSend *e = g_ob_sends[ob_send_hash(cls, sel)]; e; e = e->next)
-        if (e->cls == cls && e->sel == sel && e->generation == generation)
+    for (ObSend *e = atomic_load(&g_ob_sends[ob_send_hash(cls, sel)]); e;
+         e = atomic_load_explicit(&e->next, memory_order_acquire))
+        if (e->cls == cls && e->sel == sel)
             return e;
     return NULL;
 }
 
-static const ObSend *ob_remember(const ObSend *scratch)
+static const ObSend *ob_cached(void *cls, void *sel)
+{
+    uint64_t generation = atomic_load(&g_ob_generation);
+    ObSend *e = ob_entry(cls, sel);
+    return e && atomic_load(&e->generation) == generation ? e : NULL;
+}
+
+static const ObSend *ob_remember(ObSend *scratch, const char *enc)
 {
     unsigned b = ob_send_hash(scratch->cls, scratch->sel);
-    ObSend *made = malloc(sizeof *made);
+    size_t len = enc ? strlen(enc) + 1 : 0;
+    ObSend *made = malloc(sizeof *made + len);
     if (!made)
         return scratch;
     *made = *scratch;
+    made->enc = NULL;
+    if (len) {
+        char *text = (char *)(made + 1);
+        memcpy(text, enc, len);
+        made->enc = text;
+    }
 
     pthread_mutex_lock(&g_ob_lock);
-    ObSend *found = NULL;
-    for (ObSend *e = g_ob_sends[b]; e && !found; e = e->next)
-        if (e->cls == scratch->cls && e->sel == scratch->sel &&
-            e->generation == scratch->generation)
-            found = e;
-    if (!found) {
-        made->next = g_ob_sends[b];
-        g_ob_sends[b] = made;
+    ObSend *found;
+    ObSend *_Atomic *link = &g_ob_sends[b];
+    ObSend *e = atomic_load(link);
+    for (; e && !(e->cls == scratch->cls && e->sel == scratch->sel);
+         link = &e->next, e = atomic_load_explicit(&e->next, memory_order_acquire))
+        ;
+    if (!e) {
+        made->next = atomic_load(&g_ob_sends[b]);
+        atomic_store(&g_ob_sends[b], made);
         found = made;
-        made = NULL;
+    } else {
+        uint64_t have = atomic_load(&e->generation);
+        if (have == scratch->generation)
+            found = e;
+        else if (have > scratch->generation)
+            found = scratch;
+        else {
+            made->next = atomic_load_explicit(&e->next, memory_order_acquire);
+            atomic_store(link, made);
+            found = made;
+        }
     }
     pthread_mutex_unlock(&g_ob_lock);
-    free(made);
+    if (found != made)
+        free(made);
     return found;
 }
 
@@ -1412,9 +1456,18 @@ static const ObSend *ob_method(void *cls, void *sel, ObSend *scratch)
     void *m = ob_class_getInstanceMethod(cls, sel);
     if (!m)
         return NULL;
-    ob_describe(cls, sel, ob_method_getTypeEncoding(m), "method", scratch);
+    const char *enc = ob_method_getTypeEncoding(m);
+    ObSend *prev = ob_entry(cls, sel);
+    if (prev && enc && prev->enc && strcmp(prev->enc, enc) == 0) {
+        uint64_t cur = atomic_load(&prev->generation);
+        while (cur < generation &&
+               !atomic_compare_exchange_weak(&prev->generation, &cur, generation))
+            ;
+        return prev;
+    }
+    ob_describe(cls, sel, enc, "method", scratch);
     scratch->generation = generation;
-    return ob_remember(scratch);
+    return ob_remember(scratch, enc);
 }
 
 int ocerz_objc_allocateClassPair(struct OcerzVM *vm, OcerzCPU *cpu)
@@ -1928,6 +1981,8 @@ static const ObSend *ob_object_blocks(void *recv, void *cls, void *sel, const Ob
 #define OB_IMP_MAX (OB_IMP_PER_PAGE * OB_IMP_PAGES)
 #define OB_IMP_STRIDE 16u
 #define OB_IMP_SLOT 0x800u
+#define OB_IMP_HASH (OB_IMP_MAX * 2)
+#define OB_IMP_HASH_BITS 14u
 
 typedef struct ObImp {
     void *imp;
@@ -1939,6 +1994,21 @@ static ObImp g_ob_imps[OB_IMP_MAX];
 static _Atomic unsigned g_ob_imps_n;
 static _Atomic uint64_t g_ob_imp_pages[OB_IMP_PAGES];
 static pthread_mutex_t g_ob_imp_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint16_t g_ob_imp_index[OB_IMP_HASH];
+
+_Static_assert(OB_IMP_MAX <= UINT16_MAX && !(OB_IMP_HASH & (OB_IMP_HASH - 1)),
+               "the IMP index holds k+1 in a u16 table whose size is a power of two");
+
+static unsigned ob_imp_find_locked(void *imp)
+{
+    unsigned h = (unsigned)(((uintptr_t)imp >> 2) * 0x9e3779b97f4a7c15ull >> (64 - OB_IMP_HASH_BITS));
+    for (;;) {
+        unsigned at = g_ob_imp_index[h];
+        if (!at || g_ob_imps[at - 1].imp == imp)
+            return h;
+        h = (h + 1) & (OB_IMP_HASH - 1);
+    }
+}
 
 static void *_Atomic g_ob_sel_methodFor;
 static void *_Atomic g_ob_sel_instanceMethodFor;
@@ -2012,10 +2082,10 @@ uint64_t ocerz_objc_imp_for_guest(void *native_imp, const char *types)
     uint64_t answer = 0;
     pthread_mutex_lock(&g_ob_imp_lock);
     unsigned n = atomic_load(&g_ob_imps_n), k;
-    for (k = 0; k < n; k++)
-        if (g_ob_imps[k].imp == native_imp)
-            break;
+    unsigned slot = ob_imp_find_locked(native_imp);
+    k = g_ob_imp_index[slot] ? g_ob_imp_index[slot] - 1 : n;
     if (k == n && n < OB_IMP_MAX) {
+        g_ob_imp_index[slot] = (uint16_t)(n + 1);
         g_ob_imps[n].imp = native_imp;
         g_ob_imps[n].types = types ? strdup(types) : NULL;
         g_ob_imps[n].stret = ob_types_stret(types);

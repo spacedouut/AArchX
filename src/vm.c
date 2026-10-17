@@ -206,7 +206,11 @@
  * back, and puts back the thread's previous recovery point and previous cpu, so
  * calls nest to any depth: guest code inside a native callback can call a
  * bridged function that calls another guest callback, and each level unwinds to
- * the state the level above it left.
+ * the state the level above it left.  The call takes its sigsetjmp with
+ * savemask 0, since the mask it would save is the empty one
+ * ocerz_host_sigmask_clear just left: it records only the sigaltstack flags,
+ * and restores the empty mask and that on-stack state itself after a jump, as
+ * siglongjmp of a savemask 1 buffer would through _sigunaltstack.
  *
  * While the copy runs it is the thread's current cpu, so a host signal that
  * arrives meanwhile is recorded on the copy.  The copy therefore takes the
@@ -370,6 +374,9 @@
 
 #define OCERZ_CALL_SENTINEL 0x00000000deadca11ull
 #define ENV_SET(name) ({ static int set_ = -1; if (set_ < 0) set_ = getenv(name) != NULL; set_; })
+#define UC_SET_ALT_STACK 0x40000000
+#define UC_RESET_ALT_STACK ((int)0x80000000u)
+extern int __sigreturn(void *uctx, int infostyle, uintptr_t token);
 
 static OcerzVM *g_vm;
 static __thread OcerzCPU *g_cur_cpu;
@@ -1510,8 +1517,10 @@ static void async_sig_handler(int sig, siginfo_t *si, void *ctx)
             __atomic_or_fetch(&c->sig_pending, 1ull << (sig - 1), __ATOMIC_SEQ_CST);
         else
             __atomic_or_fetch(&g_pending_async_mask, 1u << sig, __ATOMIC_SEQ_CST);
-        if (c)
+        if (c) {
             __atomic_fetch_add(&c->sig_host_rcvd[sig], 1u, __ATOMIC_RELAXED);
+            guest_wait_kick();
+        }
         /* a thread inside a translated loop would not see it until the loop ended */
         if (c && !g_async_shared_only && !m32_active && ctx && !(c->sig_mask >> (sig - 1) & 1) &&
             !g_no_signal_stop)
@@ -3699,11 +3708,20 @@ static int vm_call_core(OcerzVM *vm, uint64_t func, OcerzGuestCall *call, int ng
     g_sig_recover = &jb;
     ocerz_host_sigmask_clear("callback");
     uint64_t jmark = ocerz_jit_thread_mark();
+    stack_t oss;
+    sigaltstack(NULL, &oss);
+    const int onstack = oss.ss_flags;
     int esc_r;
-    if (sigsetjmp(jb, 1) == 2)
-        esc_r = t_jit_escape_r;
-    else
-        esc_r = 0;
+    int jrc = sigsetjmp(jb, 0);
+    if (jrc) {
+        sigset_t empty;
+        sigemptyset(&empty);
+        pthread_sigmask(SIG_SETMASK, &empty, NULL);
+        __sigreturn(NULL,
+                    onstack & SS_ONSTACK ? UC_SET_ALT_STACK : UC_RESET_ALT_STACK,
+                    0);
+    }
+    esc_r = jrc == 2 ? t_jit_escape_r : 0;
     t_jit_escape_r = 0;
     ocerz_jit_thread_restore(jmark);
     g_cur_cpu = &local;
@@ -4142,6 +4160,7 @@ void ocerz_thread_detach(void)
 static void ocerz_kick_handler(int sig, siginfo_t *si, void *uc)
 {
     (void)sig; (void)si; (void)uc;
+    guest_wait_kick();
 }
 static void ocerz_install_kick_handler(void)
 {

@@ -125,6 +125,13 @@
  * libtier0_s, and its first CUtlMemory growth called through g_pMemAlloc while
  * tier0's allocator singleton still had a null vtable.
  *
+ * Visited images are found through an open-addressed index of 16384 u16 slots
+ * (twice INIT_VISITED_MAX, so linear probing always reaches an empty slot)
+ * holding visited index + 1, keyed by a Fibonacci hash of the mach header
+ * address.  Entries are never removed, and init_mark still appends at
+ * g_init_visited_n and returns -1 once INIT_VISITED_MAX is reached, so index
+ * assignment and every result are unchanged.
+ *
  * Each image in that closure has its +load methods run before its
  * initializers, as dyld does and as the startup phase always did.  The closure
  * used to run initializers only, so a cache framework first pulled in by a
@@ -3479,26 +3486,47 @@ static void run_image_inits(OcerzVM *vm, uint64_t mh, const uint64_t *ia, uint64
 }
 
 #define INIT_VISITED_MAX 8192
+#define INIT_INDEX_BITS 14
+#define INIT_INDEX_SLOTS (1 << INIT_INDEX_BITS)
 static uint64_t g_init_visited[INIT_VISITED_MAX];
 static uint32_t g_init_gen[INIT_VISITED_MAX];
 static uint8_t g_init_done[INIT_VISITED_MAX];
 static uint8_t g_load_done[INIT_VISITED_MAX];
 static uint8_t g_init_being[INIT_VISITED_MAX];
 static int g_init_visited_n;
+static uint16_t g_init_index[INIT_INDEX_SLOTS];
+
+_Static_assert(INIT_INDEX_SLOTS >= 2 * INIT_VISITED_MAX && INIT_VISITED_MAX <= UINT16_MAX,
+               "the init index holds visited+1 in a u16 table twice the visited array's size");
 static uint32_t g_init_cur_gen;
 static int g_init_force;
 static int g_init_collect_depth;
 static uint64_t g_libsys_mh;
 
-static int init_mark(uint64_t mh)
+static int init_find(uint64_t mh)
 {
-    for (int i = 0; i < g_init_visited_n; i++)
+    unsigned slot = (unsigned)((mh * 0x9e3779b97f4a7c15ull) >> (64 - INIT_INDEX_BITS));
+    for (;;) {
+        unsigned entry = g_init_index[slot];
+        if (!entry)
+            return -(int)slot - 1;
+        int i = (int)entry - 1;
         if (g_init_visited[i] == mh)
             return i;
+        slot = (slot + 1) & (INIT_INDEX_SLOTS - 1);
+    }
+}
+
+static int init_mark(uint64_t mh)
+{
+    int found = init_find(mh);
+    if (found >= 0)
+        return found;
     if (g_init_visited_n >= INIT_VISITED_MAX)
         return -1;
     int i = g_init_visited_n++;
     g_init_visited[i] = mh;
+    g_init_index[-found - 1] = (uint16_t)(i + 1);
     g_init_gen[i] = 0;
     g_init_done[i] = 0;
     g_init_being[i] = 0;
@@ -3507,10 +3535,8 @@ static int init_mark(uint64_t mh)
 
 static int init_is_done(uint64_t mh)
 {
-    for (int i = 0; i < g_init_visited_n; i++)
-        if (g_init_visited[i] == mh)
-            return g_init_done[i];
-    return 0;
+    int i = init_find(mh);
+    return i >= 0 ? g_init_done[i] : 0;
 }
 
 static int is_umbrella_path(const char *p)
