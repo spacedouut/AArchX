@@ -122,7 +122,12 @@ stronger x86 memory ordering for the rest of its run.
 
 ## Testing
 
-`make check` builds and runs the test suites and takes roughly half an hour.
+For the Rust port, run `bash tools/rust_gate.sh`. It runs the suites and
+compares failures with the [C baseline](agents/baseline.md). You can also use
+`make check` (about half an hour for a full run), but it stops at the first
+failing phase. On the macOS 26 baseline machine, a unit test that expects
+macOS 27 API files stops it before the guest tests.
+
 The guest suite runs each program twice, once in the interpreter and once with
 the JIT, and checks the output byte for byte. The i386 differential test also
 compares registers, flags and memory.
@@ -137,9 +142,6 @@ the Rust port:
 | i386 differential | 20,033 / 20,033 |
 | Dynamic linking | 113 / 113 |
 | Native mode | 87 / 87 |
-
-On this branch, `bash tools/rust_gate.sh` compares the build's failures with
-the [C baseline](agents/baseline.md) so known failures don't hide new ones.
 
 ## Documentation
 
