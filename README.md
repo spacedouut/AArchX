@@ -75,10 +75,11 @@ calls an export with no bridge, AArchX stops and names it. See the
 
 ## Performance
 
-On an Apple M5 running macOS 27 on September 21, 2026, AArchX beat Rosetta on
-most of these 15 kernels. Both ran the same x86-64 binary linked against
-libSystem; AArchX used cache mode. Each bar is AArchX time divided by Rosetta
-time, with startup excluded. Below 1.0 means AArchX was faster.
+These measurements are from the C translator, before the Rust port. On an
+Apple M5 running macOS 27 on September 21, 2026, it beat Rosetta on most of
+these 15 kernels. Both ran the same x86-64 binary linked against libSystem;
+AArchX used cache mode. Each bar is AArchX time divided by Rosetta time,
+with startup excluded. Below 1.0 means AArchX was faster.
 
 ```mermaid
 xychart-beta
