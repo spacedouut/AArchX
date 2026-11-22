@@ -143,7 +143,7 @@ the [C baseline](agents/baseline.md) so known failures don't hide new ones.
 
 ## Documentation
 
-- [Getting started](docs/getting-started.md): running a program and passing arguments.
+- [Getting started](docs/getting-started.md#run-something): running a program and passing arguments. The guide builds the C version; use the [quick start above](#quick-start) to build this branch.
 - [Modes](docs/modes.md) and [native mode in depth](docs/native-mode.md): how AArchX calls system libraries.
 - [Reference](docs/reference.md): flags, environment variables and exit codes.
 - [Troubleshooting](docs/troubleshooting.md): where to look when a program fails.
